@@ -1,0 +1,909 @@
+// ============================================================
+// БЛОК 1. ГЛАВНЫЙ ИНТЕРФЕЙС, АВТО-МЕНЮ И УПРАВЛЕНИЕ ТРИГГЕРАМИ
+// ============================================================
+
+function onOpen() {
+  try {
+    var ui = SpreadsheetApp.getUi();
+    ui.createMenu('💼 ')
+      .addItem('🔄 1. Обновить календарь и цены', 'startUniqueBondCalendarGeneration2026')
+      .addItem('📅 2. Синхронизировать с Google Календарем', 'syncPaymentsWithGoogleCalendar')
+      .addSeparator()
+      .addItem('⏰ 3. Включить автообновление каждый день', 'setupDailyAutomatedTriggers')
+      .addToUi();
+  } catch(e) {
+    Logger.log("Не удалось добавить меню: " + e.message);
+  }
+}
+
+/**
+ * Создает автоматический триггер для запуска обновления каждый день в нерабочее время (20:00 - 21:00)
+ */
+function setupDailyAutomatedTriggers() {
+  var triggerName = 'startUniqueBondCalendarGeneration2026';
+  var triggers = ScriptApp.getProjectTriggers();
+  
+  // Удаляем старые дубликаты триггеров, если они есть
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === triggerName) {
+      ScriptApp.deleteTrigger(triggers[i]);
+    }
+  }
+  
+  // Создаем новый ежедневный триггер
+  ScriptApp.newTrigger(triggerName)
+    .timeBased()
+    .everyDays(1)
+    .atHour(20)
+    .create();
+    
+  SpreadsheetApp.getUi().alert("⏰ Автоматизация включена! Скрипт будет обновлять цены и календарь каждый день между 20:00 и 21:00 по МСК.");
+}
+
+// ============================================================
+// БЛОК 2. МЕГА-УСКОРЕНИЕ: ПАКЕТНЫЙ ЗАГРУЗЧИК РЫНОЧНЫХ ДАННЫХ MOEX (BATCH ISS)
+// ============================================================
+
+/**
+ * Загружает рыночные данные (Цены, НКД, Купоны) по ВСЕМ облигациям на бирже за 2 быстрых запроса
+ * @return {Object} Кэш данных в формате { ISIN: { price, cpn, nkd, cpnPeriod, maturity } }
+ */
+function fetchAllMoexDataBatch() {
+  var moexCache = {};
+  var boards = ["TQOB", "TQCB"]; // TQOB - ОФЗ, TQCB - Корпоративные облигации
+  
+  for (var b = 0; b < boards.length; b++) {
+    var board = boards[b];
+    // Запрашиваем таблицы marketdata (цены) и securities (параметры бумаг) одновременно
+    var url = "https://moex.com" + board + "/securities.json?iss.meta=off&iss.only=securities,marketdata";
+    
+    try {
+      var response = UrlFetchApp.fetch(url, {muteHttpExceptions: true});
+      if (response.getResponseCode() !== 200) continue;
+      
+      var json = JSON.parse(response.getContentText());
+      if (!json) continue;
+      
+      // 1. Парсим статические параметры (Купоны, НКД, Базовые данные)
+      var secData = json.securities;
+      if (secData && secData.data) {
+        var secCols = secData.columns;
+        var isinIdx = secCols.indexOf("ISIN");
+        var cpnPercentIdx = secCols.indexOf("COUPONPERCENT");
+        var cpnValueIdx = secCols.indexOf("COUPONVALUE");
+        var nkdIdx = secCols.indexOf("ACCRUEDINT");
+        var periodIdx = secCols.indexOf("COUPONPERIOD");
+        var matIdx = secCols.indexOf("MATDATE");
+        var faceIdx = secCols.indexOf("FACEVALUE");
+        
+        for (var i = 0; i < secData.data.length; i++) {
+          var row = secData.data[i];
+          var isin = String(row[isinIdx]).trim().toUpperCase();
+          if (!isin) continue;
+          
+          moexCache[isin] = {
+            price: 0,
+            couponPercent: parseFloat(row[cpnPercentIdx]) || 0,
+            couponValue: parseFloat(row[cpnValueIdx]) || 0,
+            nkd: parseFloat(row[nkdIdx]) || 0,
+            period: parseInt(row[periodIdx], 10) || 0,
+            maturity: row[matIdx] ? String(row[matIdx]).trim() : "",
+            faceValue: parseFloat(row[faceIdx]) || 1000
+          };
+        }
+      }
+      
+      // 2. Парсим динамические рыночные цены (LAST, LCURRENTPRICE)
+      var marketData = json.marketdata;
+      if (marketData && marketData.data) {
+        var mCols = marketData.columns;
+        var mIsinIdx = mCols.indexOf("SECID"); // В marketdata ISIN лежит в SECID
+        var lastIdx = mCols.indexOf("LAST");
+        var currIdx = mCols.indexOf("LCURRENTPRICE");
+        var marketIdx = mCols.indexOf("MARKETPRICE");
+        
+        for (var j = 0; j < marketData.data.length; j++) {
+          var mRow = marketData.data[j];
+          var mIsin = String(mRow[mIsinIdx]).trim().toUpperCase();
+          if (!moexCache[mIsin]) continue;
+          
+          var lastPrice = parseFloat(mRow[lastIdx]);
+          var currPrice = parseFloat(mRow[currIdx]);
+          var marketPrice = parseFloat(mRow[marketIdx]);
+          
+          // Выбираем приоритетную ненулевую цену
+          var validPrice = lastPrice || currPrice || marketPrice || 0;
+          if (validPrice > 0) {
+            moexCache[mIsin].price = validPrice;
+          }
+        }
+      }
+    } catch(e) {
+      Logger.log("Ошибка пакетной загрузки для режима " + board + ": " + e.message);
+    }
+  }
+  return moexCache;
+}
+
+// ============================================================
+// БЛОК 3. МАТЕМАТИЧЕСКИЙ ДВИЖОК: ДИНАМИЧЕСКИЙ РАСЧЕТ ЧИСТОЙ YTM И СИГНАЛОВ
+// ============================================================
+
+/**
+ * Рассчитывает внутреннюю норму доходности (YTM/XIRR) для облигации на основе денежных потоков
+ * @param {number} currentPricePct Текущая чистая цена в % от номинала (например, 98.5)
+ * @param {number} faceValue Номинал облигации (например, 1000)
+ * @param {number} nkd Накопленный купонный доход (₽)
+ * @param {number} couponValue Размер купона (₽)
+ * @param {number} frequency Количество выплат в год
+ * @param {string} maturityStr Дата погашения в формате YYYY-MM-DD
+ * @return {number} Годовая доходность к погашению (в долях, например 0.215 для 21.5%)
+ */
+function calculateExactYTM(currentPricePct, faceValue, nkd, couponValue, frequency, maturityStr) {
+  if (!currentPricePct || currentPricePct <= 0 || !maturityStr) return 0;
+  
+  var today = new Date();
+  today.setHours(0, 0, 0, 0);
+  
+  var maturityDate = parseDateLocal(maturityStr);
+  if (!maturityDate || maturityDate <= today) return 0;
+  
+  // Полная (грязная) цена покупки одной облигации
+  var dirtyPrice = (currentPricePct / 100) * faceValue + nkd;
+  
+  // Расчет оставшихся дней до погашения
+  var daysToMaturity = Math.ceil((maturityDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+  if (daysToMaturity <= 0) return 0;
+  
+  // Строим приближенный календарь будущих выплат купонов
+  var monthsStep = 12 / (frequency || 2);
+  var cashFlows = [];
+  
+  // Первый денежный поток — покупка облигации (отрицательное значение)
+  cashFlows.push({ date: new Date(today.getTime()), amount: -dirtyPrice });
+  
+  var tempDate = new Date(maturityDate.getTime());
+  
+  // Идем назад от даты погашения, чтобы восстановить даты купонов
+  while (tempDate > today) {
+    cashFlows.push({ date: new Date(tempDate.getTime()), amount: couponValue });
+    tempDate.setMonth(tempDate.getMonth() - monthsStep);
+  }
+  
+  // В дату погашения также возвращается номинал
+  if (cashFlows.length > 1) {
+    cashFlows[1].amount += faceValue; 
+  }
+  
+  // Сортируем денежные потоки по дате (от ранних к поздним)
+  cashFlows.sort(function(a, b) { return a.date - b.date; });
+  
+  // Алгоритм Ньютона-Рафсона для нахождения внутренней ставки доходности (XIRR)
+  var rate = 0.15; // Начальное приближение (15%)
+  for (var iteration = 0; iteration < 50; iteration++) {
+    var fValue = 0;
+    var fDerivative = 0;
+    
+    for (var i = 0; i < cashFlows.length; i++) {
+      var d = Math.ceil((cashFlows[i].date - cashFlows[0].date) / (1000 * 60 * 60 * 24)) / 365;
+      var expTerm = Math.pow(1 + rate, d);
+      
+      fValue += cashFlows[i].amount / expTerm;
+      fDerivative -= d * cashFlows[i].amount / (expTerm * (1 + rate));
+    }
+    
+    if (Math.abs(fDerivative) < 1e-10) break;
+    
+    var newRate = rate - fValue / fDerivative;
+    if (Math.abs(newRate - rate) < 1e-6) {
+      rate = newRate;
+      break;
+    }
+    rate = newRate;
+  }
+  
+  return (rate > 0 && rate < 2) ? rate : 0;
+}
+
+/**
+ * Генерирует текстовый индикатор и рекомендацию на основе значения доходности (YTM)
+ */
+function generateMarketSignal(ytmPercent, maturityStr) {
+  var dateLabel = maturityStr ? " до " + maturityStr : "";
+  if (!ytmPercent || ytmPercent <= 0) {
+    return "⚪ Нет данных YTM";
+  }
+  
+  // Текущие пороговые значения доходностей на 2026 год
+  if (ytmPercent > 23.0) {
+    return "🔥 КУПИТЬ ЕЩЕ (YTM " + ytmPercent.toFixed(2) + "%" + dateLabel + ")";
+  } else if (ytmPercent >= 16.0) {
+    return "🟢 Держать (YTM " + ytmPercent.toFixed(2) + "%" + dateLabel + ")";
+  } else {
+    return "🚨 ПРОДАТЬ/ПЕРЕЛОЖИТЬ (YTM " + ytmPercent.toFixed(2) + "%" + dateLabel + ")";
+  }
+}
+
+// ============================================================
+// БЛОК 4. ПАКЕТНОЕ ОБНОВЛЕНИЕ БАЗЫ ОБЛИГАЦИЙ (ЦЕНЫ, НКД, ТЕКУЩИЙ НОМИНАЛ)
+// ============================================================
+
+/**
+ * Сканирует лист "Облигации", подтягивает данные из кэша MOEX и обновляет рыночные параметры
+ */
+function updateAllBondValuesFromCache() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("Облигации");
+  if (!sheet) return;
+  
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+  
+  // Получаем кэш со всей биржи за 2 запроса
+  var moexCache = fetchAllMoexDataBatch();
+  
+  // Читаем ключевые диапазоны для расчетов
+  var isinRange = sheet.getRange("A2:A" + lastRow);
+  var isins = isinRange.getValues();
+  
+  // Массивы для пакетной записи обратно в таблицу
+  var priceData = [];    // Сюда пойдут рыночные цены (%)
+  var nkdData = [];      // Накопленный купонный доход (₽)
+  var ytmData = [];      // Рассчитанная чистая доходность YTM (%)
+  
+  for (var i = 0; i < isins.length; i++) {
+    var isin = String(isins[i][0]).replace(/[^A-Z0-9]/gi, '').trim().toUpperCase();
+    
+    if (isin && moexCache[isin]) {
+      var bondInfo = moexCache[isin];
+      
+      // Читаем параметры из таблицы или падаем на дефолты из кэша
+      var frequency = Number(sheet.getRange(i + 2, 10).getValue()) || bondInfo.period || 2;
+      var faceValue = Number(sheet.getRange(i + 2, 14).getValue()) || bondInfo.faceValue || 1000;
+      var couponValue = Number(sheet.getRange(i + 2, 16).getValue()) || bondInfo.couponValue || 0;
+      var maturityStr = bondInfo.maturity;
+      
+      // Считаем точную внутреннюю норму доходности (XIRR/YTM)
+      var calculatedYtm = calculateExactYTM(bondInfo.price, faceValue, bondInfo.nkd, couponValue, frequency, maturityStr);
+      var ytmPercent = calculatedYtm * 100;
+      
+      priceData.push([bondInfo.price]);
+      nkdData.push([bondInfo.nkd]);
+      ytmData.push([ytmPercent / 100]); // Записываем в долях, Google Sheets сам отформатирует как %
+    } else {
+      // Если бумаги нет в кэше, оставляем старые или нулевые значения
+      priceData.push([0]);
+      nkdData.push([0]);
+      ytmData.push([0]);
+    }
+  }
+  
+  // Быстрая пакетная запись в соответствующие столбцы таблицы
+  // Предполагаем стандартную структуру: цены, НКД и YTM имеют свои колонки (настройте буквы под себя при необходимости)
+  // Для безопасности пишем в фиксированные места (например: Цена в столбец K, НКД в L, YTM в P)
+  sheet.getRange("K2:K" + lastRow).setValues(priceData).setNumberFormat('0.00"%"');
+  sheet.getRange("L2:L" + lastRow).setValues(nkdData).setNumberFormat('#,##0.00');
+  sheet.getRange("P2:P" + lastRow).setValues(ytmData).setNumberFormat('0.00%');
+  
+  SpreadsheetApp.flush();
+}
+
+// ============================================================
+// БЛОК 5. АВТОМАТИЧЕСКИЙ СДВИГ ДАТ ПРОШЕДШИХ КУПОНОВ И ЗАЩИТА ОТ NaN
+// ============================================================
+
+function autoUpdateCouponDates() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("Облигации");
+  if (!sheet) return;
+  
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+  
+  var today = new Date();
+  today.setHours(0, 0, 0, 0);
+  
+  // Пакетное считывание данных для производительности
+  var couponRange = sheet.getRange("M2:M" + lastRow);
+  var data = sheet.getRange("A2:M" + lastRow).getDisplayValues(); 
+  
+  var outputDates = [];
+  var updated = false;
+  
+  for (var i = 0; i < data.length; i++) {
+    var rawCouponDate = data[i][12]; // Столбец M
+    var rawMaturity = data[i][6];    // Столбец G
+    var frequency = parseInt(data[i][9]) || 0; // Столбец J
+    
+    // Проверка на NaN и валидность данных
+    if (!rawCouponDate || rawCouponDate.indexOf("NaN") !== -1 || frequency <= 0) {
+      outputDates.push([rawCouponDate]);
+      continue;
+    }
+    
+    var couponDate = parseDateLocal(rawCouponDate);
+    var maturityDate = parseDateLocal(rawMaturity);
+    
+    if (couponDate && couponDate <= today) {
+      // Расчет новой даты купона
+      var monthsStep = 12 / frequency;
+      couponDate.setMonth(couponDate.getMonth() + Math.ceil((today - couponDate) / (1000 * 60 * 60 * 24 * 30.4 * (12/frequency))) * monthsStep);
+      
+      // Защита: дата купона не может быть позже даты погашения
+      if (maturityDate && couponDate > maturityDate) { 
+        couponDate = maturityDate; 
+      }
+      
+      outputDates.push([Utilities.formatDate(couponDate, Session.getScriptZone(), "dd.MM.yyyy")]);
+      updated = true;
+    } else {
+      outputDates.push([rawCouponDate]);
+    }
+  }
+  
+  // Быстрая запись обновлений
+  if (updated) {
+    couponRange.setNumberFormat("@");
+    couponRange.setValues(outputDates);
+    SpreadsheetApp.flush();
+  }
+}
+// ============================================================
+// БЛОК 6. ЧАСТЬ 1 ИЗ 5. ГЛАВНАЯ ФУНКЦИЯ-ОРКЕСТРАТОР
+// ============================================================
+
+function startUniqueBondCalendarGeneration2026() {
+  // 1. Очищаем вертикальный текст БКС на листе КалендарьИнвестора
+  cleanBksVerticalText();
+  
+  // 2. Автоматически заносим новые бумаги на лист Облигации
+  autoAddNewBondsFromCalendar();
+  
+  // 3. Пакетно обновляем рыночные цены, НКД и YTM из быстрого кэша MOEX
+  updateAllBondValuesFromCache();
+  
+  // 4. Переходим к подготовке структуры листа Свод_Календарь
+  prepareDestSheetStructure();
+}
+// ============================================================
+// БЛОК 6. ЧАСТЬ 2 ИЗ 5. СТРУКТУРА И ШАПКА ТАБЛИЦЫ
+// ============================================================
+
+function prepareDestSheetStructure() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var destSheetName = "Свод_Календарь";
+  var destSheet = ss.getSheetByName(destSheetName);
+  
+  // Если лист существует — очищаем, если нет — создаем с нуля
+  if (destSheet) { 
+    destSheet.clear(); 
+  } else { 
+    destSheet = ss.insertSheet(destSheetName); 
+  }
+  
+  // Создаем массив заголовков для сводной таблицы
+  var headers = [["Месяц", "Эмитент / Выпуск", "ISIN", "Дата отсечки", "Кол-во (шт)", "Ставка (%)", "Сумма грязными (₽)", "НДФЛ 13% (₽)", "Сумма чистыми (₽)", "Рыночный сигнал (YTM)"]];
+  
+  // Записываем шапку и форматируем её
+  destSheet.getRange("A1:J1")
+    .setValues(headers)
+    .setFontWeight("bold")
+    .setBackground("#f3f3f3")
+    .setHorizontalAlignment("center");
+    
+  // Передаем управление третьей части для фильтрации и расчета выплат
+  generateCalendarDataRows(destSheet);
+}
+// ============================================================
+// БЛОК 6. ЧАСТЬ 3.1 ИЗ 5. СБОР И ПОДГОТОВКА СТРОК КАЛЕНДАРЯ
+// ============================================================
+
+function generateCalendarDataRows(destSheet) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sourceSheet = ss.getSheetByName("КалендарьИнвестора");
+  if (!sourceSheet) return;
+  
+  var sourceLastRow = sourceSheet.getLastRow();
+  if (sourceLastRow < 2) return;
+  
+  // Строго читаем все данные как ТЕКСТ во избежание сбоев дат
+  var calData = sourceSheet.getRange(2, 1, sourceLastRow - 1, 8).getDisplayValues();
+  var amortizationMap = getAmortizationData();
+  
+  var finalData = [];
+  var chartValues = [];
+  var totalRowsIndices = [];
+  var monthsNames = ["ЯНВАРЬ", "ФЕВРАЛЬ", "МАРТ", "АПРЕЛЬ", "МАЙ", "ИЮНЬ", "ИЮЛЬ", "АВГУСТ", "СЕНТЯБРЬ", "ОКТЯБРЬ", "НОЯБРЬ", "ДЕКАБРЬ"];
+  
+  // Передаем управление в подфункцию обработки месяцев (Часть 3.2)
+  processMonthsLoop(destSheet, calData, amortizationMap, finalData, chartValues, totalRowsIndices, monthsNames);
+}
+// ============================================================
+// БЛОК 6. ЧАСТЬ 3.2.1. ФИЛЬТРАЦИЯ СТРОК ПО МЕСЯЦАМ
+// ============================================================
+
+function processMonthsLoop(destSheet, calData, amortizationMap, finalData, chartValues, totalRowsIndices, monthsNames) {
+  // Проходим по каждому из 12 месяцев года
+  for (var m = 0; m < monthsNames.length; m++) {
+    var targetMonthName = monthsNames[m];
+    var runningDirty = 0, runningNdfl = 0, runningClean = 0;
+    var hasBondsInMonth = false;
+    
+    // Сканируем все строки из Календаря Инвестора
+    for (var i = 0; i < calData.length; i++) {
+      var dateStr = calData[i][2]; // Дата отсечки в текстовом виде
+      if (!dateStr) continue;
+      
+      // Бьем дату через точку "ДД.ММ.ГГГГ"
+      var parts = dateStr.split('.');
+      if (parts.length !== 3) continue;
+      
+      // Проверяем, совпадает ли месяц (индекс с нуля, поэтому вычитаем 1)
+      var bondMonthIdx = parseInt(parts[1], 10) - 1;
+      if (bondMonthIdx === m) {
+        hasBondsInMonth = true;
+        
+        // Передаем строку для расчета денег и YTM-сигнала в следующую микро-часть
+        processSingleBondRow(calData[i], amortizationMap, finalData, targetMonthName, hasBondsInMonth);
+        
+        // Аккумулируем суммы
+        runningDirty += parseFloat(calData[i][5].replace(/\s/g, '').replace(',', '.')) || 0;
+        runningNdfl += parseFloat(calData[i][6].replace(/\s/g, '').replace(',', '.')) || 0;
+        runningClean += parseFloat(calData[i][7].replace(/\s/g, '').replace(',', '.')) || 0;
+      }
+    }
+    
+    // Если в месяце были выплаты, добавляем строку "ИТОГ МЕСЯЦА"
+    if (hasBondsInMonth) {
+      var totalRowNum = finalData.length + 2; // +2 с учетом шапки таблицы
+      finalData.push([
+        "ИТОГ " + targetMonthName, "ИТОГ_МЕСЯЦ", "", "-", "-", "-",
+        Math.round(runningDirty * 100) / 100, Math.round(runningNdfl * 100) / 100, Math.round(runningClean * 100) / 100, "-"
+      ]);
+      totalRowsIndices.push(totalRowNum);
+      chartValues.push([targetMonthName, Math.round(runningClean * 100) / 100]);
+    }
+  }
+  
+  // Передаем накопленные массивы в Часть 4 для выгрузки на лист
+  flushCalendarToSheet(destSheet, finalData, totalRowsIndices, chartValues);
+}
+// ============================================================
+// БЛОК 6. ЧАСТЬ 3.2.2. РАСЧЕТ ОДНОЙ СТРОКИ ОБЛИГАЦИИ И СИГНАЛА YTM
+// ============================================================
+
+function processSingleBondRow(row, amortizationMap, finalData, targetMonthName, hasBondsInMonth) {
+  var name = row[0];
+  var isin = row[1];
+  var dateStr = row[2];
+  var qty = parseFloat(row[3]) || 0;
+  var rateStr = row[4];
+  
+  // Извлекаем чистые финансовые значения
+  var dirtyValue = parseFloat(row[5].replace(/\s/g, '').replace(',', '.')) || 0;
+  var ndfl = parseFloat(row[6].replace(/\s/g, '').replace(',', '.')) || 0;
+  var clean = parseFloat(row[7].replace(/\s/g, '').replace(',', '.')) || 0;
+  
+  // Метка месяца пишется только один раз на первую строчку группы
+  var monthLabelToPrint = (finalData.length === 0 || finalData[finalData.length - 1][1] === "ИТОГ_МЕСЯЦ") ? targetMonthName : "";
+  
+  // По умолчанию — сигнала нет
+  var signalText = "⚪ Нет данных YTM на листе Облигации";
+  
+  // Если бумага есть в нашей базе — генерируем умный рыночный сигнал
+  if (isin && amortizationMap[isin]) {
+    var currentYTM = amortizationMap[isin].ytm;
+    var maturityStr = amortizationMap[isin].maturity || "";
+    
+    // Вызываем генератор сигналов из Блока 3
+    signalText = generateMarketSignal(currentYTM, maturityStr);
+  }
+  
+  // Добавляем готовую строчку в общую матрицу
+  finalData.push([monthLabelToPrint, name, isin, dateStr, qty, rateStr, dirtyValue, ndfl, clean, signalText]);
+}
+// ============================================================================
+// БЛОК 6. ЧАСТЬ 5 ИЗ 5. ГРАФИК АНАЛИТИКИ ДОХОДОВ ПОРТФЕЛЯ
+// ДАННЫЙ БЛОК ОТВЕЧАЕТ ЗА ОТРИСОВКУ ПОЛЬЗОВАТЕЛЬСКОЙ 3D-ДИАГРАММЫ ВЫПЛАТ ПО МЕСЯЦАМ
+// ============================================================================
+
+function renderAnalyticsChart2026(chartValues) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var chartSheetName = "Аналитика_Дохода";
+  var chartSheet = ss.getSheetByName(chartSheetName);
+  
+  // Пересоздаем лист, очищая старые данные и графики
+  if (chartSheet) {
+    chartSheet.clear().getCharts().forEach(c => chartSheet.removeChart(c));
+  } else {
+    chartSheet = ss.insertSheet(chartSheetName);
+  }
+  
+  // Подготовка данных и визуальное оформление
+  chartSheet.getRange("A1:B1").setValues([["Месяц", "Доход (₽)"]]).setFontWeight("bold").setBackground("#f3f3f3");
+  chartSheet.getRange(2, 1, chartValues.length, 2).setValues(chartValues);
+  chartSheet.getRange("B2:B" + (chartValues.length + 1)).setNumberFormat('#,##0.00');
+  
+  // Настройка диаграммы (3D, столбчатая)
+  var chart = chartSheet.newChart()
+    .setChartType(Charts.ChartType.COLUMN)
+    .addRange(chartSheet.getRange("A1:B" + (chartValues.length + 1)))
+    .setPosition(1, 4, 10, 0)
+    .setOption('title', '💡 Чистый прогноз выплат 2026 (3D)')
+    .setOption('is3D', true)
+    .setOption('colors', ['#198754'])
+    .setOption('legend', {position: 'none'})
+    .build();
+    
+  chartSheet.insertChart(chart);
+}
+// ============================================================================
+// БЛОК 7. ЧАСТЬ 1: ПОДКЛЮЧЕНИЕ К КАЛЕНДАРЮ И ОЧИСТКА
+// ============================================================================
+
+function syncPaymentsWithGoogleCalendar() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("Свод_Календарь");
+  if (!sheet || sheet.getLastRow() < 2) return;
+  
+  var data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 10).getDisplayValues();
+  var calName = "💼 Инвестиции БКС (Купоны)";
+  var calendars = CalendarApp.getCalendarsByName(calName);
+  var cal = (calendars.length > 0) ? calendars[0] : CalendarApp.createCalendar(calName);
+  
+  // Очистка старых событий, чтобы избежать дубликатов
+  var oldEvents = cal.getEvents(new Date(2020, 0, 1), new Date(3000, 0, 1));
+  for (var i = 0; i < oldEvents.length; i++) { oldEvents[i].deleteEvent(); }
+  
+  // Переход к следующей части
+  processCalendarEventsLoop(cal, data, 0);
+}
+// ============================================================================
+// БЛОК 7. ЧАСТЬ 2: АНАЛИЗ СТРОК И ФОРМИРОВАНИЕ УМНЫХ ЗАГОЛОВКОВ
+// ============================================================================
+
+function processCalendarEventsLoop(cal, data, count) {
+  for (var j = 0; j < data.length; j++) {
+    var name = String(data[j][1]).trim();
+    var isin = String(data[j][2]).trim();
+    var rawDateStr = String(data[j][3]).trim();
+    var cleanSum = data[j][8];
+    var signal = String(data[j][9]).trim();
+    
+    // Пропускаем технические строки итогов
+    if (name === "ИТОГ_МЕСЯЦ" || name === "" || name.indexOf("ИТОГ") !== -1) continue;
+    
+    var parts = rawDateStr.split('.');
+    if (parts.length !== 3) continue;
+    
+    var day = parseInt(parts[0], 10);
+    var month = parseInt(parts[1], 10) - 1;
+    var year = parseInt(parts[2], 10);
+    
+    var eventDate = new Date(year, month, day, 10, 0, 0);
+    if (isNaN(eventDate.getTime())) continue;
+    
+    // Выстраиваем заголовок на основе рыночных сигналов
+    var title = "💰 Купон: " + name + " (+" + cleanSum + " ₽)";
+    if (signal.indexOf("🚨") !== -1) title = "🚨 ПРОДАТЬ " + name + "!";
+    if (signal.indexOf("🔥") !== -1) title = "🔥 КУПИТЬ " + name + "!";
+    
+    // Передаем сформированные данные в финальный блок для создания события
+    count = writeSingleEventToCalendar(cal, title, eventDate, name, isin, cleanSum, signal, count);
+  }
+  
+  // Сообщаем пользователю об успешном завершении всей синхронизации
+  SpreadsheetApp.getUi().alert("🚀 Синхронизация завершена! Успешно добавлено " + count + " инвест-событий.");
+}
+// ============================================================================
+// БЛОК 7. ЧАСТЬ 3: ГЕНЕРАЦИЯ ОПИСАНИЙ И ЗАПИСЬ СОБЫТИЯ В КАЛЕНДАРЬ
+// ============================================================================
+
+function writeSingleEventToCalendar(cal, title, eventDate, name, isin, cleanSum, signal, count) {
+  var actionPlan = "";
+  
+  // Подбираем текстовый план действий на основе рыночного сигнала YTM
+  if (signal.indexOf("🚨") !== -1) {
+    actionPlan = "💡 АНАЛИТИКА БКС:\n⚠ Бумага перегрета, доходность упала. Рекомендуется ПРОДАТЬ выпуск в приложении БКС и зафиксировать прибыль.";
+  } else if (signal.indexOf("🔥") !== -1) {
+    actionPlan = "💡 АНАЛИТИКА БКС:\n📈 Высокая доходность! Цена занижена. Рекомендуется ИСПОЛЬЗОВАТЬ поступающие купоны для ДОКУПКИ этого выпуска.";
+  } else {
+    actionPlan = "💡 АНАЛИТИКА БКС:\n🟢 Стабильный плановый доход. Купоны отправляем на плановое реинвестирование.";
+  }
+  
+  // Формируем красивую карточку описания
+  var description = "📋 СВОДКА ПО ВЫПЛАТЕ:\n" +
+                    "• Облигация: " + name + "\n" +
+                    "• Код ISIN: " + isin + "\n" +
+                    "• Сумма чистыми: " + cleanSum + " ₽\n" +
+                    "• Статус YTM: " + signal + "\n\n" +
+                    "----------------------------------------\n" +
+                    actionPlan;
+                    
+  try {
+    // Записываем событие в Google Календарь на весь день
+    cal.createEvent(title, eventDate, eventDate, {description: description});
+    count++;
+  } catch(e) {
+    Logger.log("Ошибка записи события: " + e.toString());
+  }
+  
+  return count;
+}
+
+// ============================================================================
+// БЛОК 8. ЧАСТЬ 1: ПОТОКОВЫЙ ПАРСЕР ЛЕНТЫ БКС — СБОР СТРОК И ИДЕНТИФИКАЦИЯ ISIN
+// ============================================================================
+
+function cleanBksVerticalText() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("КалендарьИнвестора");
+  if (!sheet) return;
+  
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 1) return;
+  
+  var rawValues = sheet.getRange(1, 1, lastRow, 1).getDisplayValues();
+  var lines = [];
+  
+  // Отсекаем пустые строки и убираем лишние пробелы
+  for (var k = 0; k < rawValues.length; k++) {
+    var lineText = String(rawValues[k]).trim();
+    if (lineText !== "") lines.push(lineText);
+  }
+  
+  var cleanRows = [];
+  var currentObj = null;
+  
+  // Построчный разбор текста ленты выплат
+  for (var p = 0; p < lines.length; p++) {
+    var line = lines[p];
+    
+    // Пропускаем мусорные заголовки БКС ленты
+    if (line === "Дата отсечки" || line === "Сумма" || line === "Купон" || line === "₽" || line === "%") {
+      continue;
+    }
+    
+    // Регулярное выражение для поиска стандартного кода ISIN
+    var isinMatch = line.match(/^(RU|SU)[A-Z0-9]{10}$/i) || (line === "MGKL1P3");
+    
+    if (isinMatch) {
+      // Сохраняем предыдущий объект, если он был полностью собран
+      if (currentObj && currentObj.isin && currentObj.dirty > 0) {
+        cleanRows.push(buildFinalBksArray(currentObj));
+      }
+      
+      var finalIsin = line.toUpperCase().trim();
+      if (finalIsin === "MGKL1P3") finalIsin = "RU000A10FDE3"; // Маппинг частного случая
+      
+      currentObj = {
+        name: (p >= 1) ? lines[p-1] : "Облигация",
+        isin: finalIsin,
+        date: "",
+        qty: 0,
+        rate: "0,00%",
+        dirty: 0
+      };
+      
+      // Защита: если имя совпало с кодом, берем строку еще выше
+      if (currentObj.name === currentObj.isin && p >= 2) currentObj.name = lines[p-2];
+      continue;
+    }
+    
+    // Передаем наполнение параметров (даты, количества, суммы) во вторую часть
+    parseBksDetailsLine(line, currentObj);
+  }
+  
+  // Передаем собранные чистые строки в функцию финализации
+  flushBksCleanRowsToSheet(sheet, cleanRows, currentObj);
+}
+// ============================================================================
+// БЛОК 8. ЧАСТЬ 2: РАСПОЗНАВАНИЕ ФИНАНСОВЫХ СУММ И ПЕРЕЗАПИСЬ ТАБЛИЦЫ
+// ============================================================================
+
+/**
+ * Разбирает значения внутренних параметров (даты, количества, суммы) из текущей строки
+ */
+function parseBksDetailsLine(line, currentObj) {
+  if (!currentObj) return;
+  
+  // Регулярное выражение для поиска дат формата ДД.ММ.ГГГГ
+  var dateMatch = line.match(/^\d{2}\.\d{2}\.\d{4}$/);
+  if (dateMatch) {
+    currentObj.date = line;
+    return;
+  }
+  
+  // Находим процентные ставки купона
+  if (line.indexOf('%') !== -1) {
+    currentObj.rate = line;
+    return;
+  }
+  
+  // Находим количество штук (если строка заканчивается на шт.)
+  if (line.toLowerCase().indexOf('шт') !== -1 || line.toLowerCase().indexOf('pcs') !== -1) {
+    currentObj.qty = parseFloat(line.replace(/[^0-9]/g, '')) || 0;
+    return;
+  }
+  
+  // Если строка содержит валюту или является просто числом с запятой — это сумма выплаты
+  if (line.indexOf('₽') !== -1 || line.indexOf(',') !== -1 || !isNaN(parseFloat(line.replace(/\s/g, '').replace(',', '.')))) {
+    var val = parseFloat(line.replace(/[^\d.,-]/g, '').replace(/\s/g, '').replace(',', '.')) || 0;
+    if (val > 0 && currentObj.dirty === 0) {
+      currentObj.dirty = val;
+    }
+  }
+}
+
+/**
+ * Формирует одномерный упорядоченный массив для выгрузки в строки таблицы
+ */
+function buildFinalBksArray(obj) {
+  var ndfl = Math.round((obj.dirty * 0.13) * 100) / 100;
+  var clean = Math.round((obj.dirty - ndfl) * 100) / 100;
+  
+  return [
+    obj.name,     // А: Эмитент
+    obj.isin,     // B: ISIN
+    obj.date,     // C: Дата отсечки
+    obj.qty,      // D: Кол-во шт
+    obj.rate,     // E: Ставка купона
+    obj.dirty,    // F: Сумма грязными
+    ndfl,         // G: НДФЛ
+    clean         // H: Сумма чистыми
+  ];
+}
+
+/**
+ * Очищает лист и выполняет пакетную запись структурированных данных БКС
+ */
+function flushBksCleanRowsToSheet(sheet, cleanRows, currentObj) {
+  // Добавляем самый последний объект, если он не был добавлен в цикле
+  if (currentObj && currentObj.isin && currentObj.dirty > 0) {
+    cleanRows.push(buildFinalBksArray(currentObj));
+  }
+  
+  if (cleanRows.length === 0) return;
+  
+  sheet.clear();
+  
+  // Создаем стандартные заголовки для листа КалендарьИнвестора
+  var headers = [["Эмитент / Выпуск", "ISIN", "Дата отсечки", "Кол-во (шт)", "Ставка (%)", "Сумма грязными (₽)", "НДФЛ 13% (₽)", "Сумма чистыми (₽)"]];
+  sheet.getRange(1, 1, 1, 8).setValues(headers).setFontWeight("bold").setBackground("#e6effa");
+  
+  // Пакетная запись чистых строк
+  sheet.getRange(2, 1, cleanRows.length, 8).setValues(cleanRows);
+  
+  // Наводим косметический порядок: форматы чисел и авто-ширина столбцов
+  sheet.getRange("D2:D" + (cleanRows.length + 1)).setNumberFormat('#,##0');
+  sheet.getRange("F2:H" + (cleanRows.length + 1)).setNumberFormat('#,##0.00');
+  sheet.autoResizeColumns(1, 8);
+  
+  SpreadsheetApp.flush();
+}
+// ============================================================================
+// БЛОК 9. ШЛЮЗ АВТОДОБАВЛЕНИЯ НОВЫХ БУМАГ С МОСКОВСКОЙ БИРЖИ
+// ============================================================================
+
+function autoAddNewBondsFromCalendar() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var bondSheet = ss.getSheetByName("Облигации");
+  var calSheet = ss.getSheetByName("КалендарьИнвестора");
+  
+  if (!bondSheet || !calSheet || calSheet.getLastRow() < 2) return;
+  
+  // 1. Собираем список уже существующих ISIN в базе облигаций
+  var existingIsins = {};
+  var bondLastRow = bondSheet.getLastRow();
+  if (bondLastRow >= 2) {
+    var bondIsins = bondSheet.getRange("A2:A" + bondLastRow).getValues();
+    for (var i = 0; i < bondIsins.length; i++) {
+      var bIsin = String(bondIsins[i][0]).trim().toUpperCase();
+      if (bIsin) existingIsins[bIsin] = true;
+    }
+  }
+  
+  // 2. Читаем ISIN из календаря выплат
+  var calLastRow = calSheet.getLastRow();
+  var calIsins = calSheet.getRange("B2:B" + calLastRow).getValues();
+  var calNames = calSheet.getRange("A2:A" + calLastRow).getValues();
+  
+  // 3. Получаем быстрый пакетный кэш со всей биржи MOEX
+  var moexCache = fetchAllMoexDataBatch();
+  var newBondsData = [];
+  
+  for (var j = 0; j < calIsins.length; j++) {
+    var targetIsin = String(calIsins[j][0]).trim().toUpperCase();
+    var emitterName = String(calNames[j][0]).trim();
+    
+    // Если этого ISIN еще нет в таблице и он присутствует в кэше биржи
+    if (targetIsin && !existingIsins[targetIsin] && moexCache[targetIsin]) {
+      var moexInfo = moexCache[targetIsin];
+      
+      // Формируем новую строку в формате вашей базы (Адаптируйте порядок столбцов под себя)
+      // Столбец A: ISIN, B: Название, G: Дата погашения, J: Периодичность, K: Цена (%), L: НКД, N: Номинал, P: YTM
+      var newRow = new Array(20).fill(""); // Создаем пустой массив на 20 колонок
+      
+      newRow[0] = targetIsin;                               // Столбец A
+      newRow[1] = emitterName || "Новый выпуск";            // Столбец B
+      newRow[6] = moexInfo.maturity;                        // Столбец G (Мат. дата)
+      newRow[9] = moexInfo.period || 2;                     // Столбец J (Купонов в год)
+      newRow[10] = moexInfo.price || 100;                    // Столбец K (Рыночная цена %)
+      newRow[11] = moexInfo.nkd || 0;                        // Столбец L (Текущий НКД)
+      newRow[13] = moexInfo.faceValue || 1000;              // Столбец N (Номинал)
+      newRow[15] = moexInfo.couponValue || 0;               // Столбец P (Размер купона в ₽)
+      
+      newBondsData.push(newRow);
+      existingIsins[targetIsin] = true; // Защита от дублирования внутри цикла
+    }
+  }
+  
+  // 4. Пакетная дозапись новых бумаг в конец таблицы
+  if (newBondsData.length > 0) {
+    var startRow = bondSheet.getLastRow() + 1;
+    bondSheet.getRange(startRow, 1, newBondsData.length, 20).setValues(newBondsData);
+    
+    // Принудительно запускаем перерасчет YTM для добавленных позиций
+    updateAllBondValuesFromCache();
+    Logger.log("Успешно добавлено новых бумаг в базу: " + newBondsData.length);
+  }
+}
+// ============================================================================
+// БЛОК 10. КРОСС-ПЛАТФОРМЕННЫЙ ПАРСЕР ДАТ С ЗАЩИТОЙ ВРЕМЕННЫХ ЗОН
+// ============================================================================
+
+/**
+ * Безопасно преобразует любые текстовые форматы дат в объект Date без смещения таймзон
+ * @param {string|Date} dateVal Входное значение (строка типа "25.12.2026", "2026-12-25" или объект Date)
+ * @return {Date|null} Корректный объект Date с обнуленным временем или null при ошибке
+ */
+function parseDateLocal(dateVal) {
+  if (!dateVal) return null;
+  
+  // Если на вход уже пришел готовый объект Date, просто обнуляем время
+  if (dateVal instanceof Date) {
+    var cleanDate = new Date(dateVal.getTime());
+    cleanDate.setHours(0, 0, 0, 0);
+    return cleanDate;
+  }
+  
+  var dateStr = String(dateVal).trim();
+  if (dateStr === "" || dateStr.indexOf("NaN") !== -1) return null;
+  
+  var day, month, year;
+  
+  // Вариант 1: Формат ДД.ММ.ГГГГ или ДД/ММ/ГГГГ (стандарт БКС и ручного ввода)
+  if (dateStr.indexOf('.') !== -1 || dateStr.indexOf('/') !== -1) {
+    var separator = dateStr.indexOf('.') !== -1 ? '.' : '/';
+    var parts = dateStr.split(separator);
+    if (parts.length === 3) {
+      day = parseInt(parts[0], 10);
+      month = parseInt(parts[1], 10) - 1; // В JS месяцы идут от 0 до 11
+      year = parseInt(parts[2], 10);
+    }
+  } 
+  // Вариант 2: Формат ГГГГ-ММ-ДД (стандарт ответов MOEX ISS)
+  else if (dateStr.indexOf('-') !== -1) {
+    var isoParts = dateStr.split('-');
+    if (isoParts.length === 3) {
+      year = parseInt(isoParts[0], 10);
+      month = parseInt(isoParts[1], 10) - 1;
+      day = parseInt(isoParts[2], 10);
+    }
+  }
+  
+  // Если ни один формат не подошел, пробуем стандартный конструктор
+  if (isNaN(day) || isNaN(month) || isNaN(year)) {
+    var fallbackDate = new Date(dateStr);
+    if (!isNaN(fallbackDate.getTime())) {
+      fallbackDate.setHours(0, 0, 0, 0);
+      return fallbackDate;
+    }
+    return null;
+  }
+  
+  // Создаем локальную дату без влияния часового пояса сервера Google
+  var finalResultDate = new Date(year, month, day, 0, 0, 0, 0);
+  return isNaN(finalResultDate.getTime()) ? null : finalResultDate;
+}
+
