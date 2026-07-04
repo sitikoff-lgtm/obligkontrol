@@ -1,0 +1,2063 @@
+// ============================================================
+// БЛОК 1. ГЛАВНЫЙ ИНТЕРФЕЙС, АВТО-МЕНЮ И УПРАВЛЕНИЕ ТРИГГЕРАМИ
+// ============================================================
+
+function onOpen() {
+  try {
+    var ui = SpreadsheetApp.getUi();
+    
+    // Создаем главное меню с подменю
+    var menu = ui.createMenu('💼 ');
+// В функции onOpen() внутри создания меню:
+
+// ПОДМЕНЮ "📋 Логи"
+var logsSubMenu = ui.createMenu('📋 Логи');
+logsSubMenu.addItem('📊 Проверить статус портфеля', 'checkPortfolioHealth');
+logsSubMenu.addItem('🔍 Показать последние логи', 'showLastLogs');
+logsSubMenu.addSeparator();
+logsSubMenu.addItem('🔎 Проверить ISIN на MOEX', 'checkIsinList'); // <-- НОВЫЙ ПУНКТ
+logsSubMenu.addSeparator();
+logsSubMenu.addItem('🗑️ Очистить все логи', 'clearLogs');
+// В подменю "📋 Логи" добавь:
+logsSubMenu.addItem('🔬 Диагностика MOEX', 'diagnoseMoexResponse');
+
+menu.addSubMenu(logsSubMenu);
+
+
+    
+    // Основные пункты меню
+    menu.addItem('🔄 1. Обновить календарь и цены', 'startUniqueBondCalendarGeneration2026');
+    menu.addItem('📅 2. Синхронизировать с Google Календарем', 'syncPaymentsWithGoogleCalendar');
+    menu.addSeparator();
+    menu.addItem('⏰ 3. Включить автообновление каждый день', 'setupDailyAutomatedTriggers');
+    menu.addSeparator();
+    
+    // ПОДМЕНЮ "📋 Логи"
+    var logsSubMenu = ui.createMenu('📋 Логи');
+    logsSubMenu.addItem('📊 Проверить статус портфеля', 'checkPortfolioHealth');
+    logsSubMenu.addItem('🔍 Показать последние логи', 'showLastLogs');
+    logsSubMenu.addSeparator();
+    logsSubMenu.addItem('🗑️ Очистить все логи', 'clearLogs');
+    
+    // Добавляем подменю в главное меню
+    menu.addSubMenu(logsSubMenu);
+    
+    // Добавляем меню в интерфейс
+    menu.addToUi();
+    
+  } catch(e) {
+    Logger.log("Не удалось добавить меню: " + e.message);
+  }
+}
+
+/**
+ * Создает автоматический триггер для запуска обновления каждый день в нерабочее время (20:00 - 21:00)
+ */
+function setupDailyAutomatedTriggers() {
+  var triggerName = 'startUniqueBondCalendarGeneration2026';
+  var triggers = ScriptApp.getProjectTriggers();
+  
+  // Удаляем старые дубликаты триггеров, если они есть
+  var deletedCount = 0;
+  for (var i = 0; i < triggers.length; i++) {
+    if (triggers[i].getHandlerFunction() === triggerName) {
+      ScriptApp.deleteTrigger(triggers[i]);
+      deletedCount++;
+    }
+  }
+  
+  // Создаем новый ежедневный триггер
+  ScriptApp.newTrigger(triggerName)
+    .timeBased()
+    .everyDays(1)
+    .atHour(20)
+    .create();
+  
+  // Логируем действие
+  writeToLogSheet("ИНФО", "Автообновление включено (20:00 МСК). Удалено старых триггеров: " + deletedCount, 0);
+  
+  SpreadsheetApp.getUi().alert("⏰ Автоматизация включена! Скрипт будет обновлять цены и календарь каждый день между 20:00 и 21:00 по МСК.");
+}
+
+// ============================================================
+// ДОПОЛНИТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ РАБОТЫ С ЛОГАМИ (ВЫЗЫВАЮТСЯ ИЗ МЕНЮ)
+// ============================================================
+
+/**
+ * Показывает последние 10 записей из логов в диалоговом окне
+ */
+function showLastLogs() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var logSheet = ss.getSheetByName("Логи");
+  
+  if (!logSheet) {
+    SpreadsheetApp.getUi().alert("❌ Лист 'Логи' не найден. Запусти обновление портфеля, чтобы создать его.");
+    return;
+  }
+  
+  var lastRow = logSheet.getLastRow();
+  if (lastRow < 2) {
+    SpreadsheetApp.getUi().alert("ℹ️ Логов пока нет. Запусти обновление портфеля.");
+    return;
+  }
+  
+  // Читаем последние 10 записей
+  var startRow = Math.max(2, lastRow - 9);
+  var logs = logSheet.getRange(startRow, 1, lastRow - startRow + 1, 4).getValues();
+  
+  // Формируем сообщение
+  var message = "📋 **ПОСЛЕДНИЕ " + logs.length + " СОБЫТИЙ:**\n";
+  message += "═══════════════════════════════════════\n\n";
+  
+  for (var i = 0; i < logs.length; i++) {
+    var time = logs[i][0];
+    var status = logs[i][1];
+    var text = logs[i][2];
+    var count = logs[i][3];
+    
+    var emoji = "●";
+    if (status === "УСПЕХ") emoji = "✅";
+    else if (status === "ОШИБКА") emoji = "❌";
+    else if (status === "ПРЕДУПРЕЖДЕНИЕ") emoji = "⚠️";
+    else if (status === "ИНФО") emoji = "ℹ️";
+    
+    message += emoji + " " + time + " | " + status;
+    if (count > 0) message += " (" + count + " шт.)";
+    message += "\n   " + text + "\n\n";
+  }
+  
+  // Показываем в диалоге (ограничение по длине)
+  if (message.length > 50000) {
+    message = message.substring(0, 49000) + "\n... (логи слишком длинные, откройте лист 'Логи')";
+  }
+  
+  SpreadsheetApp.getUi().alert(message);
+}
+
+/**
+ * Проверяет статус портфеля и показывает сводку
+ */
+function checkPortfolioHealth() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var logSheet = ss.getSheetByName("Логи");
+  
+  if (!logSheet) {
+    SpreadsheetApp.getUi().alert("❌ Лист 'Логи' отсутствует. Запусти обновление портфеля.");
+    return;
+  }
+  
+  var lastRow = logSheet.getLastRow();
+  if (lastRow < 2) {
+    SpreadsheetApp.getUi().alert("ℹ️ Логов пока нет. Запусти обновление портфеля.");
+    return;
+  }
+  
+  // Считаем статистику по статусам
+  var allLogs = logSheet.getRange(2, 2, lastRow - 1, 2).getValues();
+  var stats = {
+    УСПЕХ: 0,
+    ОШИБКА: 0,
+    ПРЕДУПРЕЖДЕНИЕ: 0,
+    ИНФО: 0
+  };
+  
+  var lastErrors = [];
+  
+  for (var i = 0; i < allLogs.length; i++) {
+    var status = allLogs[i][0];
+    var message = allLogs[i][1];
+    
+    if (stats.hasOwnProperty(status)) {
+      stats[status]++;
+    }
+    
+    // Собираем последние 3 ошибки
+    if (status === "ОШИБКА" && lastErrors.length < 3) {
+      lastErrors.push(message);
+    }
+  }
+  
+  // Формируем отчет
+  var total = allLogs.length;
+  var message = "📊 **СТАТУС ПОРТФЕЛЯ**\n";
+  message += "═══════════════════════════════\n\n";
+  message += "📝 Всего записей: " + total + "\n\n";
+  message += "✅ Успешно: " + stats.УСПЕХ + "\n";
+  message += "⚠️ Предупреждений: " + stats.ПРЕДУПРЕЖДЕНИЕ + "\n";
+  message += "❌ Ошибок: " + stats.ОШИБКА + "\n";
+  message += "ℹ️ Информации: " + stats.ИНФО + "\n\n";
+  
+  // Показываем здоровье портфеля
+  var health = "🟢 Отлично";
+  if (stats.ОШИБКА > 0) {
+    health = "🔴 Требуется внимание!";
+    message += "⚠️ **Последние ошибки:**\n";
+    for (var j = 0; j < lastErrors.length; j++) {
+      message += "  • " + lastErrors[j] + "\n";
+    }
+    message += "\n";
+  }
+  message += "💚 Состояние: " + health;
+  
+  SpreadsheetApp.getUi().alert(message);
+}
+
+/**
+ * Очищает все логи (оставляет только шапку)
+ */
+function clearLogs() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var logSheet = ss.getSheetByName("Логи");
+  
+  if (!logSheet) {
+    SpreadsheetApp.getUi().alert("❌ Лист 'Логи' не найден.");
+    return;
+  }
+  
+  var lastRow = logSheet.getLastRow();
+  if (lastRow <= 1) {
+    SpreadsheetApp.getUi().alert("ℹ️ Логи уже пусты.");
+    return;
+  }
+  
+  // Запрашиваем подтверждение
+  var response = SpreadsheetApp.getUi().alert(
+    "⚠️ Подтверждение очистки",
+    "Вы уверены, что хотите удалить все логи? (Будет оставлена только шапка таблицы)",
+    SpreadsheetApp.getUi().ButtonSet.YES_NO
+  );
+  
+  if (response === SpreadsheetApp.getUi().Button.YES) {
+    logSheet.deleteRows(2, lastRow - 1);
+    writeToLogSheet("ИНФО", "Логи очищены пользователем вручную", 0);
+    SpreadsheetApp.getUi().alert("✅ Логи успешно очищены.");
+  }
+}
+
+
+// ============================================================================
+// БЛОК 2. ЗАГРУЗЧИК ДАННЫХ MOEX (РАБОТАЕТ С БИРЖЕВЫМИ БУМАГАМИ)
+// ============================================================================
+
+function fetchAllMoexDataBatch() {
+  var moexCache = {};
+  
+  // ТОЛЬКО БИРЖЕВЫЕ БУМАГИ (внебиржевые исключены, например RU000A10FDE3)
+  var allIsins = [
+    "RU000A108P46", "RU000A107RZ0", "RU000A10BPZ1", "RU000A1061K1",
+    "SU26244RMFS2", "SU26240RMFS0", "SU26233RMFS5", "SU26230RMFS1",
+    "RU000A106UW3", "RU000A1077X0", "RU000A107XA1", "RU000A1098F3",
+    "RU000A10EYJ1", "RU000A10CC99", "RU000A10DZW3", "RU000A10DSG1",
+    "RU000A107UU5"
+  ];
+  
+  writeToLogSheet("ИНФО", "Загрузка " + allIsins.length + " биржевых бумаг с MOEX...", 0);
+  
+  var successCount = 0;
+  var notFoundCount = 0;
+  var errorCount = 0;
+  
+  for (var i = 0; i < allIsins.length; i++) {
+    var isin = allIsins[i];
+    
+    // ПРАВИЛЬНЫЙ URL (работает как в успешном тесте)
+    var url = "https://moex.com/iss/securities.json?q=" + isin + "&iss.meta=off&iss.only=securities,marketdata";
+    
+    try {
+      // Задержка между запросами (важно для MOEX)
+      if (i > 0) Utilities.sleep(300);
+      
+      var response = UrlFetchApp.fetch(url, {
+        muteHttpExceptions: true,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Accept': 'application/json'
+        }
+      });
+      
+      // Проверяем статус ответа
+      if (response.getResponseCode() !== 200) {
+        writeToLogSheet("ПРЕДУПРЕЖДЕНИЕ", isin + " → код " + response.getResponseCode(), 0);
+        errorCount++;
+        continue;
+      }
+      
+      var json = JSON.parse(response.getContentText());
+      
+      // Проверяем, есть ли данные
+      if (!json || !json.securities || !json.securities.data || json.securities.data.length === 0) {
+        writeToLogSheet("ПРЕДУПРЕЖДЕНИЕ", isin + " → не найден на MOEX", 0);
+        notFoundCount++;
+        continue;
+      }
+      
+      // ============================================================
+      // ПАРСИМ ДАННЫЕ ИЗ securities
+      // ============================================================
+      var sCols = json.securities.columns;
+      var sRow = json.securities.data[0];
+      
+      // Находим ISIN
+      var isinIdx = sCols.indexOf("isin");
+      if (isinIdx === -1) isinIdx = sCols.indexOf("secid");
+      var actualIsin = String(sRow[isinIdx]).trim().toUpperCase();
+      
+      // Базовая структура
+      moexCache[actualIsin] = {
+        price: 0,
+        nkd: 0,
+        faceValue: 1000,
+        maturity: "",
+        couponValue: 0,
+        period: 2
+      };
+      
+      // ============================================================
+      // ПАРСИМ ДАННЫЕ ИЗ marketdata (ЦЕНА И НКД)
+      // ============================================================
+      if (json.marketdata && json.marketdata.data && json.marketdata.data.length > 0) {
+        var mCols = json.marketdata.columns;
+        var mRow = json.marketdata.data[0];
+        
+        // === ЦЕНА: перебираем все возможные названия ===
+        var priceNames = ["LAST", "LCURRENTPRICE", "MARKETPRICE", "PREVPRICE", "CLOSE", "CURRENTPRICE"];
+        var priceFound = false;
+        
+        for (var p = 0; p < priceNames.length; p++) {
+          var idx = mCols.indexOf(priceNames[p]);
+          if (idx !== -1 && mRow[idx] !== undefined && mRow[idx] !== null && mRow[idx] !== "") {
+            var val = parseFloat(mRow[idx]);
+            if (!isNaN(val) && val > 0) {
+              moexCache[actualIsin].price = val;
+              priceFound = true;
+              break;
+            }
+          }
+        }
+        
+        // Если цена не найдена, пробуем через BID/OFFER
+        if (!priceFound) {
+          var bidIdx = mCols.indexOf("BID");
+          var offerIdx = mCols.indexOf("OFFER");
+          
+          if (bidIdx !== -1 && offerIdx !== -1) {
+            var bid = parseFloat(mRow[bidIdx]) || 0;
+            var offer = parseFloat(mRow[offerIdx]) || 0;
+            if (bid > 0 && offer > 0) {
+              moexCache[actualIsin].price = (bid + offer) / 2;
+              priceFound = true;
+            }
+          }
+        }
+        
+        // === НКД: перебираем все возможные названия ===
+        var nkdNames = ["ACCRUEDINT", "ACCRUEDINT_VALUE", "NKD", "ACCRUEDINTEREST"];
+        
+        for (var n = 0; n < nkdNames.length; n++) {
+          var idx = mCols.indexOf(nkdNames[n]);
+          if (idx !== -1 && mRow[idx] !== undefined && mRow[idx] !== null && mRow[idx] !== "") {
+            var val = parseFloat(mRow[idx]);
+            if (!isNaN(val) && val >= 0) {
+              moexCache[actualIsin].nkd = val;
+              break;
+            }
+          }
+        }
+      }
+      
+      successCount++;
+      writeToLogSheet(
+        "ИНФО", 
+        "✓ " + actualIsin + " → цена: " + moexCache[actualIsin].price + 
+        ", НКД: " + moexCache[actualIsin].nkd, 
+        0
+      );
+      
+    } catch(e) {
+      writeToLogSheet("ОШИБКА", isin + " → " + e.message, 0);
+      errorCount++;
+    }
+  }
+  
+  // ============================================================
+  // ФИНАЛЬНЫЙ ОТЧЕТ
+  // ============================================================
+  
+  var totalFound = Object.keys(moexCache).length;
+  
+  writeToLogSheet(
+    "ИНФО", 
+    "Загрузка завершена: найдено " + totalFound + " из " + allIsins.length + 
+    " (ошибок: " + errorCount + ", не найдено: " + notFoundCount + ")", 
+    totalFound
+  );
+  
+  if (totalFound > 0) {
+    writeToLogSheet("УСПЕХ", "Данные загружены для " + totalFound + " биржевых бумаг", totalFound);
+  } else {
+    writeToLogSheet("ОШИБКА", "Не удалось загрузить данные ни по одной бумаге!", 0);
+  }
+  
+  // Информируем о внебиржевых бумагах
+  if (notFoundCount > 0) {
+    writeToLogSheet(
+      "ИНФО", 
+      "Внебиржевые бумаги пропущены — данные вносятся вручную", 
+      0
+    );
+  }
+  
+  return moexCache;
+}
+
+// ============================================================
+// БЛОК 3. МАТЕМАТИЧЕСКИЙ ДВИЖОК: ДИНАМИЧЕСКИЙ РАСЧЕТ ЧИСТОЙ YTM И СИГНАЛОВ
+// ============================================================
+
+/**
+ * Рассчитывает внутреннюю норму доходности (YTM/XIRR) для облигации на основе денежных потоков
+ * @param {number} currentPricePct Текущая чистая цена в % от номинала (например, 98.5)
+ * @param {number} faceValue Номинал облигации (например, 1000)
+ * @param {number} nkd Накопленный купонный доход (₽)
+ * @param {number} couponValue Размер купона (₽)
+ * @param {number} frequency Количество выплат в год
+ * @param {string} maturityStr Дата погашения в формате YYYY-MM-DD
+ * @return {number} Годовая доходность к погашению (в долях, например 0.215 для 21.5%)
+ */
+function calculateExactYTM(currentPricePct, faceValue, nkd, couponValue, frequency, maturityStr) {
+  if (!currentPricePct || currentPricePct <= 0 || !maturityStr) return 0;
+  
+  var today = new Date();
+  today.setHours(0, 0, 0, 0);
+  
+  var maturityDate = parseDateLocal(maturityStr);
+  if (!maturityDate || maturityDate <= today) return 0;
+  
+  // Полная (грязная) цена покупки одной облигации
+  var dirtyPrice = (currentPricePct / 100) * faceValue + nkd;
+  
+  // Расчет оставшихся дней до погашения
+  var daysToMaturity = Math.ceil((maturityDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+  if (daysToMaturity <= 0) return 0;
+  
+  // Строим приближенный календарь будущих выплат купонов
+  var monthsStep = 12 / (frequency || 2);
+  var cashFlows = [];
+  
+  // Первый денежный поток — покупка облигации (отрицательное значение)
+  cashFlows.push({ date: new Date(today.getTime()), amount: -dirtyPrice });
+  
+  var tempDate = new Date(maturityDate.getTime());
+  
+  // Идем назад от даты погашения, чтобы восстановить даты купонов
+  while (tempDate > today) {
+    cashFlows.push({ date: new Date(tempDate.getTime()), amount: couponValue });
+    tempDate.setMonth(tempDate.getMonth() - monthsStep);
+  }
+  
+  // В дату погашения также возвращается номинал
+  if (cashFlows.length > 1) {
+    cashFlows[1].amount += faceValue; 
+  }
+  
+  // Сортируем денежные потоки по дате (от ранних к поздним)
+  cashFlows.sort(function(a, b) { return a.date - b.date; });
+  
+  // Алгоритм Ньютона-Рафсона для нахождения внутренней ставки доходности (XIRR)
+  var rate = 0.15; // Начальное приближение (15%)
+  for (var iteration = 0; iteration < 50; iteration++) {
+    var fValue = 0;
+    var fDerivative = 0;
+    
+    for (var i = 0; i < cashFlows.length; i++) {
+      var d = Math.ceil((cashFlows[i].date - cashFlows[0].date) / (1000 * 60 * 60 * 24)) / 365;
+      var expTerm = Math.pow(1 + rate, d);
+      
+      fValue += cashFlows[i].amount / expTerm;
+      fDerivative -= d * cashFlows[i].amount / (expTerm * (1 + rate));
+    }
+    
+    if (Math.abs(fDerivative) < 1e-10) break;
+    
+    var newRate = rate - fValue / fDerivative;
+    if (Math.abs(newRate - rate) < 1e-6) {
+      rate = newRate;
+      break;
+    }
+    rate = newRate;
+  }
+  
+  return (rate > 0 && rate < 2) ? rate : 0;
+}
+
+/**
+ * Генерирует текстовый индикатор и рекомендацию на основе значения доходности (YTM)
+ */
+function generateMarketSignal(ytmPercent, maturityStr) {
+  var dateLabel = maturityStr ? " до " + maturityStr : "";
+  if (!ytmPercent || ytmPercent <= 0) {
+    return "⚪ Нет данных YTM";
+  }
+  
+  // Текущие пороговые значения доходностей на 2026 год
+  if (ytmPercent > 23.0) {
+    return "🔥 КУПИТЬ ЕЩЕ (YTM " + ytmPercent.toFixed(2) + "%" + dateLabel + ")";
+  } else if (ytmPercent >= 16.0) {
+    return "🟢 Держать (YTM " + ytmPercent.toFixed(2) + "%" + dateLabel + ")";
+  } else {
+    return "🚨 ПРОДАТЬ/ПЕРЕЛОЖИТЬ (YTM " + ytmPercent.toFixed(2) + "%" + dateLabel + ")";
+  }
+}
+
+
+// ============================================================================
+// БЛОК 4. ПАКЕТНОЕ ОБНОВЛЕНИЕ БАЗЫ С ИНТЕГРАЦИЕЙ СИСТЕМЫ ЛОГИРОВАНИЯ (ЦЕЛИКОМ)
+// ============================================================================
+
+function updateAllBondValuesFromCache() {
+  // Фиксируем запуск в системных логах
+  writeToLogSheet("ИНФО", "Запуск пакетного обновления параметров облигаций...", 0);
+  
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("Облигации");
+  if (!sheet) {
+    writeToLogSheet("ОШИБКА", "Лист 'Облигации' не найден в книге!", 0);
+    return;
+  }
+  
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    writeToLogSheet("ИНФО", "Таблица облигаций пустая (нет строк для обновления).", 0);
+    return;
+  }
+  
+  // 1. Запрашиваем кэш Мосбиржи через Блок 2
+  var moexCache = {};
+  try {
+    moexCache = fetchAllMoexDataBatch();
+    var cacheSize = Object.keys(moexCache).length;
+    writeToLogSheet("ИНФО", "Сервер MOEX успешно ответил. В кэш загружено " + cacheSize + " инструментов.", 0);
+  } catch(e) {
+    writeToLogSheet("ОШИБКА", "Сбой при запросе к API Мосбиржи: " + e.message, 0);
+    return;
+  }
+  
+  // Считываем коды ISIN из столбца А
+  var isins = sheet.getRange("A2:A" + lastRow).getValues();
+  
+  // Создаем изолированные вертикальные массивы для пакетного вывода
+  var priceData = [];     // Столбец I (9)  - цены %
+  var faceValueData = []; // Столбец J (10) - Новый вчерашний номинал
+  var nkdData = [];       // Столбец L (12) - НКД ₽
+  var oldFaceData = [];   // Столбец O (15) - Исторический номинал
+  
+  var updatedCount = 0;
+  var notFoundBonds = [];
+  
+  // 2. Построчная обработка кодов ISIN вашего портфеля
+  for (var i = 0; i < isins.length; i++) {
+    var isin = String(isins[i]).replace(/[^A-Z0-9]/gi, '').trim().toUpperCase();
+    
+    // Бэкап текущих ячеек на случай пропусков данных в выходные дни
+    var oldPrice = sheet.getRange(i + 2, 9).getValue();
+    var oldFace = sheet.getRange(i + 2, 10).getValue();
+    var oldNkd = sheet.getRange(i + 2, 12).getValue();
+    var oldFaceO = sheet.getRange(i + 2, 15).getValue();
+    
+    // Переводим старую цену из формата "95,79%" в чистое число 95.79 для математики
+    var cleanOldPrice = typeof oldPrice === "string" ? parseFloat(oldPrice.replace(/,/g, '.').replace(/%/g, '')) : parseFloat(oldPrice);
+    if (isNaN(cleanOldPrice) || cleanOldPrice <= 0) cleanOldPrice = 100.0;
+    
+    if (isin && moexCache[isin]) {
+      var bondInfo = moexCache[isin];
+      
+      // Если рыночная цена с биржи пустая или нулевая, защищаем ячейку старой ценой из таблицы
+      var finalPrice = (bondInfo.price && bondInfo.price > 0) ? bondInfo.price : cleanOldPrice;
+      
+      priceData.push([finalPrice / 100]); // Переводим в доли для корректного отображения %
+      faceValueData.push([bondInfo.faceValue || 1000]);
+      nkdData.push([bondInfo.nkd || 0]);
+      oldFaceData.push([bondInfo.faceValue || 1000]);
+      updatedCount++;
+    } else {
+      // Если ISIN не найден на Мосбирже, жестко сохраняем все старые параметры строки портфеля
+      if (isin) notFoundBonds.push(isin);
+      priceData.push([typeof oldPrice === "number" ? oldPrice : cleanOldPrice / 100]);
+      faceValueData.push([oldFace || 1000]);
+      nkdData.push([oldNkd || 0]);
+      oldFaceData.push([oldFaceO || 1000]);
+    }
+  }
+  
+  // 3. Безопасная пакетная выгрузка сформированных массивов в таблицу
+  try {
+    // Цены в % от номинала — Столбец I
+    sheet.getRange("I2:I" + lastRow).setValues(priceData).setNumberFormat('0.00%');
+    
+    // Текущий вчерашний номинал — Столбец J (Ваша новая колонка)
+    sheet.getRange("J2:J" + lastRow).setValues(faceValueData).setNumberFormat('#,##0.00" ₽"');
+    
+    // Накопленный купонный доход в рублях — Столбец L
+    sheet.getRange("L2:L" + lastRow).setValues(nkdData).setNumberFormat('#,##0.00');
+    
+    // Текущий номинал (исторический) — Столбец O
+    sheet.getRange("O2:O" + lastRow).setValues(oldFaceData).setNumberFormat('#,##0.00" ₽"');
+    
+    // Формируем итоговый отчет в ленту логов
+    var successMsg = "Пакетная запись параметров завершена.";
+    if (notFoundBonds.length > 0) {
+      successMsg += " Внимание, " + notFoundBonds.length + " шт. ISIN не найдены на MOEX: " + notFoundBonds.join(", ");
+    }
+    writeToLogSheet("УСПЕХ", successMsg, updatedCount);
+    
+  } catch(err) {
+    writeToLogSheet("ОШИБКА", "Критический сбой записи массивов на лист Облигации: " + err.message, 0);
+  }
+  
+  SpreadsheetApp.flush();
+}
+
+
+// ============================================================
+// БЛОК 5. АВТОМАТИЧЕСКИЙ СДВИГ ДАТ ПРОШЕДШИХ КУПОНОВ И ЗАЩИТА ОТ NaN
+// ============================================================
+
+function autoUpdateCouponDates() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("Облигации");
+  if (!sheet) return;
+  
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 2) return;
+  
+  var today = new Date();
+  today.setHours(0, 0, 0, 0);
+  
+  // Пакетное считывание данных для производительности
+  var couponRange = sheet.getRange("M2:M" + lastRow);
+  var data = sheet.getRange("A2:M" + lastRow).getDisplayValues(); 
+  
+  var outputDates = [];
+  var updated = false;
+  
+  for (var i = 0; i < data.length; i++) {
+    var rawCouponDate = data[i][12]; // Столбец M
+    var rawMaturity = data[i][6];    // Столбец G
+    var frequency = parseInt(data[i][9]) || 0; // Столбец J
+    
+    // Проверка на NaN и валидность данных
+    if (!rawCouponDate || rawCouponDate.indexOf("NaN") !== -1 || frequency <= 0) {
+      outputDates.push([rawCouponDate]);
+      continue;
+    }
+    
+    var couponDate = parseDateLocal(rawCouponDate);
+    var maturityDate = parseDateLocal(rawMaturity);
+    
+    if (couponDate && couponDate <= today) {
+      // Расчет новой даты купона
+      var monthsStep = 12 / frequency;
+      couponDate.setMonth(couponDate.getMonth() + Math.ceil((today - couponDate) / (1000 * 60 * 60 * 24 * 30.4 * (12/frequency))) * monthsStep);
+      
+      // Защита: дата купона не может быть позже даты погашения
+      if (maturityDate && couponDate > maturityDate) { 
+        couponDate = maturityDate; 
+      }
+      
+      outputDates.push([Utilities.formatDate(couponDate, Session.getScriptZone(), "dd.MM.yyyy")]);
+      updated = true;
+    } else {
+      outputDates.push([rawCouponDate]);
+    }
+  }
+  
+  // Быстрая запись обновлений
+  if (updated) {
+    couponRange.setNumberFormat("@");
+    couponRange.setValues(outputDates);
+    SpreadsheetApp.flush();
+  }
+}
+// ============================================================
+// БЛОК 6. ЧАСТЬ 1 ИЗ 5. ГЛАВНАЯ ФУНКЦИЯ-ОРКЕСТРАТОР
+// ============================================================
+
+function startUniqueBondCalendarGeneration2026() {
+  // 1. Очищаем вертикальный текст БКС на листе КалендарьИнвестора
+  cleanBksVerticalText();
+  
+  // 2. Автоматически заносим новые бумаги на лист Облигации
+  autoAddNewBondsFromCalendar();
+  
+  // 3. Пакетно обновляем рыночные цены, НКД и YTM из быстрого кэша MOEX
+  updateAllBondValuesFromCache();
+  
+  // 4. Переходим к подготовке структуры листа Свод_Календарь
+  prepareDestSheetStructure();
+}
+// ============================================================
+// БЛОК 6. ЧАСТЬ 2 ИЗ 5. СТРУКТУРА И ШАПКА ТАБЛИЦЫ
+// ============================================================
+
+function prepareDestSheetStructure() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var destSheetName = "Свод_Календарь";
+  var destSheet = ss.getSheetByName(destSheetName);
+  
+  // Если лист существует — очищаем, если нет — создаем с нуля
+  if (destSheet) { 
+    destSheet.clear(); 
+  } else { 
+    destSheet = ss.insertSheet(destSheetName); 
+  }
+  
+  // Создаем массив заголовков для сводной таблицы
+  var headers = [["Месяц", "Эмитент / Выпуск", "ISIN", "Дата отсечки", "Кол-во (шт)", "Ставка (%)", "Сумма грязными (₽)", "НДФЛ 13% (₽)", "Сумма чистыми (₽)", "Рыночный сигнал (YTM)"]];
+  
+  // Записываем шапку и форматируем её
+  destSheet.getRange("A1:J1")
+    .setValues(headers)
+    .setFontWeight("bold")
+    .setBackground("#f3f3f3")
+    .setHorizontalAlignment("center");
+    
+  // Передаем управление третьей части для фильтрации и расчета выплат
+  generateCalendarDataRows(destSheet);
+}
+// ============================================================
+// БЛОК 6. ЧАСТЬ 3.1 ИЗ 5. СБОР И ПОДГОТОВКА СТРОК КАЛЕНДАРЯ
+// ============================================================
+
+function generateCalendarDataRows(destSheet) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sourceSheet = ss.getSheetByName("КалендарьИнвестора");
+  if (!sourceSheet) return;
+  
+  var sourceLastRow = sourceSheet.getLastRow();
+  if (sourceLastRow < 2) return;
+  
+  // Строго читаем все данные как ТЕКСТ во избежание сбоев дат
+  var calData = sourceSheet.getRange(2, 1, sourceLastRow - 1, 8).getDisplayValues();
+  var amortizationMap = getAmortizationData();
+  
+  var finalData = [];
+  var chartValues = [];
+  var totalRowsIndices = [];
+  var monthsNames = ["ЯНВАРЬ", "ФЕВРАЛЬ", "МАРТ", "АПРЕЛЬ", "МАЙ", "ИЮНЬ", "ИЮЛЬ", "АВГУСТ", "СЕНТЯБРЬ", "ОКТЯБРЬ", "НОЯБРЬ", "ДЕКАБРЬ"];
+  
+  // Передаем управление в подфункцию обработки месяцев (Часть 3.2)
+  processMonthsLoop(destSheet, calData, amortizationMap, finalData, chartValues, totalRowsIndices, monthsNames);
+}
+// ============================================================
+// БЛОК 6. ЧАСТЬ 3.2.1. ФИЛЬТРАЦИЯ СТРОК ПО МЕСЯЦАМ
+// ============================================================
+
+function processMonthsLoop(destSheet, calData, amortizationMap, finalData, chartValues, totalRowsIndices, monthsNames) {
+  // Проходим по каждому из 12 месяцев года
+  for (var m = 0; m < monthsNames.length; m++) {
+    var targetMonthName = monthsNames[m];
+    var runningDirty = 0, runningNdfl = 0, runningClean = 0;
+    var hasBondsInMonth = false;
+    
+    // Сканируем все строки из Календаря Инвестора
+    for (var i = 0; i < calData.length; i++) {
+      var dateStr = calData[i][2]; // Дата отсечки в текстовом виде
+      if (!dateStr) continue;
+      
+      // Бьем дату через точку "ДД.ММ.ГГГГ"
+      var parts = dateStr.split('.');
+      if (parts.length !== 3) continue;
+      
+      // Проверяем, совпадает ли месяц (индекс с нуля, поэтому вычитаем 1)
+      var bondMonthIdx = parseInt(parts[1], 10) - 1;
+      if (bondMonthIdx === m) {
+        hasBondsInMonth = true;
+        
+        // Передаем строку для расчета денег и YTM-сигнала в следующую микро-часть
+        processSingleBondRow(calData[i], amortizationMap, finalData, targetMonthName, hasBondsInMonth);
+        
+        // Аккумулируем суммы
+        runningDirty += parseFloat(calData[i][5].replace(/\s/g, '').replace(',', '.')) || 0;
+        runningNdfl += parseFloat(calData[i][6].replace(/\s/g, '').replace(',', '.')) || 0;
+        runningClean += parseFloat(calData[i][7].replace(/\s/g, '').replace(',', '.')) || 0;
+      }
+    }
+    
+    // Если в месяце были выплаты, добавляем строку "ИТОГ МЕСЯЦА"
+    if (hasBondsInMonth) {
+      var totalRowNum = finalData.length + 2; // +2 с учетом шапки таблицы
+      finalData.push([
+        "ИТОГ " + targetMonthName, "ИТОГ_МЕСЯЦ", "", "-", "-", "-",
+        Math.round(runningDirty * 100) / 100, Math.round(runningNdfl * 100) / 100, Math.round(runningClean * 100) / 100, "-"
+      ]);
+      totalRowsIndices.push(totalRowNum);
+      chartValues.push([targetMonthName, Math.round(runningClean * 100) / 100]);
+    }
+  }
+  
+  // Передаем накопленные массивы в Часть 4 для выгрузки на лист
+  flushCalendarToSheet(destSheet, finalData, totalRowsIndices, chartValues);
+}
+
+// ============================================================================
+// ОБНОВЛЕННЫЙ БЛОК 6. ЧАСТЬ 3.2.2. РАСЧЕТ СТРОКИ С УЧЕТОМ КОЛИЧЕСТВА И ЦЕНЫ КУПОНА
+// ============================================================================
+
+function processSingleBondRow(row, amortizationMap, finalData, targetMonthName, hasBondsInMonth) {
+  var name = row[0];
+  var isin = row[1];
+  var dateStr = row[2];
+  var qty = parseFloat(row[3]) || 0; // Количество облигаций из столбца D
+  var rateStr = row[4];
+  
+  // Извлекаем чистые финансовые значения
+  var dirtyValue = parseFloat(row[5].replace(/\s/g, '').replace(',', '.')) || 0;
+  var ndfl = parseFloat(row[6].replace(/\s/g, '').replace(',', '.')) || 0;
+  var clean = parseFloat(row[7].replace(/\s/g, '').replace(',', '.')) || 0;
+  
+  // Рассчитываем стоимость ОДНОГО чистого купона на 1 бумагу
+  var singleCouponClean = (qty > 0) ? (clean / qty) : clean;
+  
+  // Метка месяца пишется только один раз на первую строчку группы
+  var monthLabelToPrint = (finalData.length === 0 || finalData[finalData.length - 1][1] === "ИТОГ_МЕСЯЦ") ? targetMonthName : "";
+  
+  // Читаем рыночный сигнал YTM с листа Облигации
+  var signalText = "⚪ Нет данных YTM на листе Облигации";
+  if (isin && amortizationMap[isin]) {
+    var currentYTM = amortizationMap[isin].ytm;
+    var maturityStr = amortizationMap[isin].maturity || "";
+    signalText = generateMarketSignal(currentYTM, maturityStr);
+  }
+  
+  // Внедряем количество и стоимость 1 купона прямо в текст столбца Сигнал / Аналитика
+  var extendedSignal = signalText + " | Итого: " + qty + " шт. (по ~" + singleCouponClean.toFixed(2) + " ₽ чистыми)";
+  
+  // Добавляем готовую строчку в общую матрицу
+  finalData.push([monthLabelToPrint, name, isin, dateStr, qty, rateStr, dirtyValue, ndfl, clean, extendedSignal]);
+}
+
+
+
+// ============================================================================
+// БЛОК 6. ЧАСТЬ 4 ИЗ 5. ВЫГРУЗКА И СТИЛИЗАЦИЯ КАЛЕНДАРЯ
+// ============================================================================
+
+function flushCalendarToSheet(destSheet, finalData, totalRowsIndices, chartValues) {
+  if (!finalData || finalData.length === 0) return;
+  
+  // 1. Пакетная выгрузка всей матрицы данных на лист
+  var outputRange = destSheet.getRange(2, 1, finalData.length, 10);
+  outputRange.setValues(finalData);
+  
+  // 2. Настройка числовых форматов: количество (целые), деньги (с копейками)
+  destSheet.getRange("E2:E" + (finalData.length + 1)).setNumberFormat('#,##0');
+  destSheet.getRange("G2:I" + (finalData.length + 1)).setNumberFormat('#,##0.00');
+  
+  // 3. Выравнивание текста, автоперенос строк и установка сетки границ
+  var range = destSheet.getRange(1, 1, finalData.length + 1, 10);
+  range.setBorder(true, true, true, true, true, true, "#d9d9d9", SpreadsheetApp.BorderStyle.SOLID)
+       .setVerticalAlignment("middle")
+       .setWrap(true);
+       
+  // Выравниваем названия эмитентов по левому краю для удобства чтения
+  destSheet.getRange(2, 2, finalData.length, 1).setHorizontalAlignment("left");
+  
+  // 4. Визуальное выделение итоговых строк месяцев (делаем их жирными и серыми)
+  for (var m = 0; m < totalRowsIndices.length; m++) {
+    destSheet.getRange(totalRowsIndices[m], 1, 1, 10)
+             .setFontWeight("bold")
+             .setBackground("#eaedf1");
+  }
+  
+  // 5. Передаем накопленные чистые доходы в финальный Блок 6.5 для построения графика
+  renderAnalyticsChart2026(chartValues);
+}
+
+// ============================================================================
+// БЛОК 6. ЧАСТЬ 5 ИЗ 5. ГРАФИК АНАЛИТИКИ ДОХОДОВ ПОРТФЕЛЯ
+// ДАННЫЙ БЛОК ОТВЕЧАЕТ ЗА ОТРИСОВКУ ПОЛЬЗОВАТЕЛЬСКОЙ 3D-ДИАГРАММЫ ВЫПЛАТ ПО МЕСЯЦАМ
+// ============================================================================
+
+function renderAnalyticsChart2026(chartValues) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var chartSheetName = "Аналитика_Дохода";
+  var chartSheet = ss.getSheetByName(chartSheetName);
+  
+  // Пересоздаем лист, очищая старые данные и графики
+  if (chartSheet) {
+    chartSheet.clear().getCharts().forEach(c => chartSheet.removeChart(c));
+  } else {
+    chartSheet = ss.insertSheet(chartSheetName);
+  }
+  
+  // Подготовка данных и визуальное оформление
+  chartSheet.getRange("A1:B1").setValues([["Месяц", "Доход (₽)"]]).setFontWeight("bold").setBackground("#f3f3f3");
+  chartSheet.getRange(2, 1, chartValues.length, 2).setValues(chartValues);
+  chartSheet.getRange("B2:B" + (chartValues.length + 1)).setNumberFormat('#,##0.00');
+  
+  // Настройка диаграммы (3D, столбчатая)
+  var chart = chartSheet.newChart()
+    .setChartType(Charts.ChartType.COLUMN)
+    .addRange(chartSheet.getRange("A1:B" + (chartValues.length + 1)))
+    .setPosition(1, 4, 10, 0)
+    .setOption('title', '💡 Чистый прогноз выплат 2026 (3D)')
+    .setOption('is3D', true)
+    .setOption('colors', ['#198754'])
+    .setOption('legend', {position: 'none'})
+    .build();
+    
+  chartSheet.insertChart(chart);
+}
+// ============================================================================
+// БЛОК 7. ЧАСТЬ 1: ПОДКЛЮЧЕНИЕ К КАЛЕНДАРЮ И ОЧИСТКА
+// ============================================================================
+
+function syncPaymentsWithGoogleCalendar() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("Свод_Календарь");
+  if (!sheet || sheet.getLastRow() < 2) return;
+  
+  var data = sheet.getRange(2, 1, sheet.getLastRow() - 1, 10).getDisplayValues();
+  var calName = "💼 Инвестиции БКС (Купоны)";
+  var calendars = CalendarApp.getCalendarsByName(calName);
+  var cal = (calendars.length > 0) ? calendars[0] : CalendarApp.createCalendar(calName);
+  
+  // Очистка старых событий, чтобы избежать дубликатов
+  var oldEvents = cal.getEvents(new Date(2020, 0, 1), new Date(3000, 0, 1));
+  for (var i = 0; i < oldEvents.length; i++) { oldEvents[i].deleteEvent(); }
+  
+  // Переход к следующей части
+  processCalendarEventsLoop(cal, data, 0);
+}
+// ============================================================================
+// БЛОК 7. ЧАСТЬ 2: АНАЛИЗ СТРОК И ФОРМИРОВАНИЕ УМНЫХ ЗАГОЛОВКОВ
+// ============================================================================
+
+function processCalendarEventsLoop(cal, data, count) {
+  for (var j = 0; j < data.length; j++) {
+    var name = String(data[j][1]).trim();
+    var isin = String(data[j][2]).trim();
+    var rawDateStr = String(data[j][3]).trim();
+    var cleanSum = data[j][8];
+    var signal = String(data[j][9]).trim();
+    
+    // Пропускаем технические строки итогов
+    if (name === "ИТОГ_МЕСЯЦ" || name === "" || name.indexOf("ИТОГ") !== -1) continue;
+    
+    var parts = rawDateStr.split('.');
+    if (parts.length !== 3) continue;
+    
+    var day = parseInt(parts[0], 10);
+    var month = parseInt(parts[1], 10) - 1;
+    var year = parseInt(parts[2], 10);
+    
+    var eventDate = new Date(year, month, day, 10, 0, 0);
+    if (isNaN(eventDate.getTime())) continue;
+    
+    // Выстраиваем заголовок на основе рыночных сигналов
+    var title = "💰 Купон: " + name + " (+" + cleanSum + " ₽)";
+    if (signal.indexOf("🚨") !== -1) title = "🚨 ПРОДАТЬ " + name + "!";
+    if (signal.indexOf("🔥") !== -1) title = "🔥 КУПИТЬ " + name + "!";
+    
+    // Передаем сформированные данные в финальный блок для создания события
+    count = writeSingleEventToCalendar(cal, title, eventDate, name, isin, cleanSum, signal, count);
+  }
+  
+  // Сообщаем пользователю об успешном завершении всей синхронизации
+  SpreadsheetApp.getUi().alert("🚀 Синхронизация завершена! Успешно добавлено " + count + " инвест-событий.");
+}
+
+// ============================================================================
+// ОБНОВЛЕННЫЙ БЛОК 7. ЧАСТЬ 3. ПЕЧАТЬ КОЛИЧЕСТВА И СТОИМОСТИ КУПОНА В КАЛЕНДАРЬ
+// ============================================================================
+
+function writeSingleEventToCalendar(cal, title, eventDate, name, isin, cleanSum, signal, count) {
+  var actionPlan = "";
+  
+  if (signal.indexOf("🚨") !== -1) {
+    actionPlan = "💡 АНАЛИТИКА БКС:\n⚠ Бумага перегрета, доходность упала. Рекомендуется ПРОДАТЬ выпуск в приложении БКС.";
+  } else if (signal.indexOf("🔥") !== -1) {
+    actionPlan = "💡 АНАЛИТИКА БКС:\n📈 Высокая доходность! Цена занижена. Рекомендуется ИСПОЛЬЗОВАТЬ купоны для ДОКУПКИ.";
+  } else {
+    actionPlan = "💡 АНАЛИТИКА БКС:\n🟢 Стабильный плановый доход. Купоны отправляем на плановое реинвестирование.";
+  }
+  
+  // Разбиваем переданную строку, чтобы вытащить инфо о штуках
+  var detailsText = "Пакет выплат";
+  if (signal.indexOf("|") !== -1) {
+    detailsText = "• " + signal.split("|")[1].trim();
+  }
+  
+  // Формируем красивую карточку описания
+  var description = "📋 СВОДКА ПО ВЫПЛАТЕ:\n" +
+                    "• Облигация: " + name + "\n" +
+                    "• Код ISIN: " + isin + "\n" +
+                    detailsText + "\n" + // Сюда встанет: "• Итого: X шт. (по ~Y ₽ чистыми)"
+                    "• Общая сумма чистыми: " + cleanSum + " ₽\n" +
+                    "• Статус YTM: " + signal.split("|")[0].trim() + "\n\n" +
+                    "----------------------------------------\n" +
+                    actionPlan;
+                    
+  try {
+    cal.createEvent(title, eventDate, eventDate, {description: description});
+    count++;
+  } catch(e) {
+    Logger.log("Ошибка записи события: " + e.toString());
+  }
+  
+  return count;
+}
+
+
+// ============================================================================
+// БЛОК 8. ЧАСТЬ 1: ПОТОКОВЫЙ ПАРСЕР ЛЕНТЫ БКС — СБОР СТРОК И ИДЕНТИФИКАЦИЯ ISIN
+// ============================================================================
+
+function cleanBksVerticalText() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("КалендарьИнвестора");
+  if (!sheet) return;
+  
+  var lastRow = sheet.getLastRow();
+  if (lastRow < 1) return;
+  
+  var rawValues = sheet.getRange(1, 1, lastRow, 1).getDisplayValues();
+  var lines = [];
+  
+  // Отсекаем пустые строки и убираем лишние пробелы
+  for (var k = 0; k < rawValues.length; k++) {
+    var lineText = String(rawValues[k]).trim();
+    if (lineText !== "") lines.push(lineText);
+  }
+  
+  var cleanRows = [];
+  var currentObj = null;
+  
+  // Построчный разбор текста ленты выплат
+  for (var p = 0; p < lines.length; p++) {
+    var line = lines[p];
+    
+    // Пропускаем мусорные заголовки БКС ленты
+    if (line === "Дата отсечки" || line === "Сумма" || line === "Купон" || line === "₽" || line === "%") {
+      continue;
+    }
+    
+    // Регулярное выражение для поиска стандартного кода ISIN
+    var isinMatch = line.match(/^(RU|SU)[A-Z0-9]{10}$/i) || (line === "MGKL1P3");
+    
+    if (isinMatch) {
+      // Сохраняем предыдущий объект, если он был полностью собран
+      if (currentObj && currentObj.isin && currentObj.dirty > 0) {
+        cleanRows.push(buildFinalBksArray(currentObj));
+      }
+      
+      var finalIsin = line.toUpperCase().trim();
+      if (finalIsin === "MGKL1P3") finalIsin = "RU000A10FDE3"; // Маппинг частного случая
+      
+      currentObj = {
+        name: (p >= 1) ? lines[p-1] : "Облигация",
+        isin: finalIsin,
+        date: "",
+        qty: 0,
+        rate: "0,00%",
+        dirty: 0
+      };
+      
+      // Защита: если имя совпало с кодом, берем строку еще выше
+      if (currentObj.name === currentObj.isin && p >= 2) currentObj.name = lines[p-2];
+      continue;
+    }
+    
+    // Передаем наполнение параметров (даты, количества, суммы) во вторую часть
+    parseBksDetailsLine(line, currentObj);
+  }
+  
+  // Передаем собранные чистые строки в функцию финализации
+  flushBksCleanRowsToSheet(sheet, cleanRows, currentObj);
+}
+// ============================================================================
+// БЛОК 8. ЧАСТЬ 2: РАСПОЗНАВАНИЕ ФИНАНСОВЫХ СУММ И ПЕРЕЗАПИСЬ ТАБЛИЦЫ
+// ============================================================================
+
+/**
+ * Разбирает значения внутренних параметров (даты, количества, суммы) из текущей строки
+ */
+function parseBksDetailsLine(line, currentObj) {
+  if (!currentObj) return;
+  
+  // Регулярное выражение для поиска дат формата ДД.ММ.ГГГГ
+  var dateMatch = line.match(/^\d{2}\.\d{2}\.\d{4}$/);
+  if (dateMatch) {
+    currentObj.date = line;
+    return;
+  }
+  
+  // Находим процентные ставки купона
+  if (line.indexOf('%') !== -1) {
+    currentObj.rate = line;
+    return;
+  }
+  
+  // Находим количество штук (если строка заканчивается на шт.)
+  if (line.toLowerCase().indexOf('шт') !== -1 || line.toLowerCase().indexOf('pcs') !== -1) {
+    currentObj.qty = parseFloat(line.replace(/[^0-9]/g, '')) || 0;
+    return;
+  }
+  
+  // Если строка содержит валюту или является просто числом с запятой — это сумма выплаты
+  if (line.indexOf('₽') !== -1 || line.indexOf(',') !== -1 || !isNaN(parseFloat(line.replace(/\s/g, '').replace(',', '.')))) {
+    var val = parseFloat(line.replace(/[^\d.,-]/g, '').replace(/\s/g, '').replace(',', '.')) || 0;
+    if (val > 0 && currentObj.dirty === 0) {
+      currentObj.dirty = val;
+    }
+  }
+}
+
+/**
+ * Формирует одномерный упорядоченный массив для выгрузки в строки таблицы
+ */
+function buildFinalBksArray(obj) {
+  var ndfl = Math.round((obj.dirty * 0.13) * 100) / 100;
+  var clean = Math.round((obj.dirty - ndfl) * 100) / 100;
+  
+  return [
+    obj.name,     // А: Эмитент
+    obj.isin,     // B: ISIN
+    obj.date,     // C: Дата отсечки
+    obj.qty,      // D: Кол-во шт
+    obj.rate,     // E: Ставка купона
+    obj.dirty,    // F: Сумма грязными
+    ndfl,         // G: НДФЛ
+    clean         // H: Сумма чистыми
+  ];
+}
+
+/**
+ * Очищает лист и выполняет пакетную запись структурированных данных БКС
+ */
+function flushBksCleanRowsToSheet(sheet, cleanRows, currentObj) {
+  // Добавляем самый последний объект, если он не был добавлен в цикле
+  if (currentObj && currentObj.isin && currentObj.dirty > 0) {
+    cleanRows.push(buildFinalBksArray(currentObj));
+  }
+  
+  if (cleanRows.length === 0) return;
+  
+  sheet.clear();
+  
+  // Создаем стандартные заголовки для листа КалендарьИнвестора
+  var headers = [["Эмитент / Выпуск", "ISIN", "Дата отсечки", "Кол-во (шт)", "Ставка (%)", "Сумма грязными (₽)", "НДФЛ 13% (₽)", "Сумма чистыми (₽)"]];
+  sheet.getRange(1, 1, 1, 8).setValues(headers).setFontWeight("bold").setBackground("#e6effa");
+  
+  // Пакетная запись чистых строк
+  sheet.getRange(2, 1, cleanRows.length, 8).setValues(cleanRows);
+  
+  // Наводим косметический порядок: форматы чисел и авто-ширина столбцов
+  sheet.getRange("D2:D" + (cleanRows.length + 1)).setNumberFormat('#,##0');
+  sheet.getRange("F2:H" + (cleanRows.length + 1)).setNumberFormat('#,##0.00');
+  sheet.autoResizeColumns(1, 8);
+  
+  SpreadsheetApp.flush();
+}
+// ============================================================================
+// БЛОК 9. ШЛЮЗ АВТОДОБАВЛЕНИЯ НОВЫХ БУМАГ С ПРОВЕРКОЙ ISIN
+// ============================================================================
+
+function autoAddNewBondsFromCalendar() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var bondSheet = ss.getSheetByName("Облигации");
+  var calSheet = ss.getSheetByName("КалендарьИнвестора");
+  
+  if (!bondSheet || !calSheet || calSheet.getLastRow() < 2) {
+    writeToLogSheet("ПРЕДУПРЕЖДЕНИЕ", "Лист 'Облигации' или 'КалендарьИнвестора' не найден или пуст", 0);
+    return;
+  }
+  
+  // 1. Собираем список уже существующих ISIN в базе облигаций
+  var existingIsins = {};
+  var bondLastRow = bondSheet.getLastRow();
+  if (bondLastRow >= 2) {
+    var bondIsins = bondSheet.getRange("A2:A" + bondLastRow).getValues();
+    for (var i = 0; i < bondIsins.length; i++) {
+      var bIsin = String(bondIsins[i][0]).trim().toUpperCase();
+      if (bIsin) existingIsins[bIsin] = true;
+    }
+  }
+  
+  // 2. Читаем ISIN из календаря выплат
+  var calLastRow = calSheet.getLastRow();
+  var calIsins = calSheet.getRange("B2:B" + calLastRow).getValues();
+  var calNames = calSheet.getRange("A2:A" + calLastRow).getValues();
+  
+  // 3. Получаем быстрый пакетный кэш со всей биржи MOEX
+  var moexCache = fetchAllMoexDataBatch();
+  var newBondsData = [];
+  var invalidIsins = [];
+  var notFoundIsins = [];
+  var alreadyExistIsins = [];
+  
+  writeToLogSheet("ИНФО", "Проверка " + calIsins.length + " ISIN из календаря...", 0);
+  
+  for (var j = 0; j < calIsins.length; j++) {
+    var targetIsin = String(calIsins[j][0]).trim().toUpperCase();
+    var emitterName = String(calNames[j][0]).trim();
+    
+    // Пропускаем технические строки
+    if (!targetIsin || targetIsin === "" || targetIsin === "ИТОГ_МЕСЯЦ" || targetIsin.indexOf("ИТОГ") !== -1) {
+      continue;
+    }
+    
+    // ============================================================
+    // ПРОВЕРКА 1: Валидность формата ISIN
+    // ============================================================
+    if (!isValidIsinFormat(targetIsin)) {
+      if (invalidIsins.indexOf(targetIsin) === -1) {
+        invalidIsins.push(targetIsin);
+      }
+      continue;
+    }
+    
+    // ============================================================
+    // ПРОВЕРКА 2: Уже существует в базе
+    // ============================================================
+    if (existingIsins[targetIsin]) {
+      if (alreadyExistIsins.indexOf(targetIsin) === -1) {
+        alreadyExistIsins.push(targetIsin);
+      }
+      continue;
+    }
+    
+    // ============================================================
+    // ПРОВЕРКА 3: Существует на MOEX
+    // ============================================================
+    if (!moexCache[targetIsin]) {
+      if (notFoundIsins.indexOf(targetIsin) === -1) {
+        notFoundIsins.push(targetIsin);
+      }
+      continue;
+    }
+    
+    // ============================================================
+    // ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ - ДОБАВЛЯЕМ БУМАГУ
+    // ============================================================
+    var moexInfo = moexCache[targetIsin];
+    
+    // Формируем новую строку (20 колонок)
+    var newRow = new Array(20).fill("");
+    
+    newRow[0] = targetIsin;                               // Столбец A: ISIN
+    newRow[1] = emitterName || "Новый выпуск";            // Столбец B: Название
+    newRow[6] = moexInfo.maturity || "";                  // Столбец G: Дата погашения
+    newRow[9] = moexInfo.period || 2;                     // Столбец J: Купонов в год
+    newRow[10] = moexInfo.price || 100;                   // Столбец K: Цена (%)
+    newRow[11] = moexInfo.nkd || 0;                       // Столбец L: НКД
+    newRow[13] = moexInfo.faceValue || 1000;              // Столбец N: Номинал
+    newRow[15] = moexInfo.couponValue || 0;               // Столбец P: Купон (₽)
+    
+    newBondsData.push(newRow);
+    existingIsins[targetIsin] = true; // Защита от дублирования
+  }
+  
+  // ============================================================
+  // ЛОГИРУЕМ РЕЗУЛЬТАТЫ ПРОВЕРКИ
+  // ============================================================
+  
+  if (invalidIsins.length > 0) {
+    writeToLogSheet(
+      "ПРЕДУПРЕЖДЕНИЕ", 
+      "Некорректный формат ISIN (" + invalidIsins.length + " шт.): " + invalidIsins.join(", "), 
+      invalidIsins.length
+    );
+  }
+  
+  if (notFoundIsins.length > 0) {
+    writeToLogSheet(
+      "ПРЕДУПРЕЖДЕНИЕ", 
+      "Не найдены на MOEX (" + notFoundIsins.length + " шт.): " + notFoundIsins.join(", "), 
+      notFoundIsins.length
+    );
+  }
+  
+  if (alreadyExistIsins.length > 0) {
+    writeToLogSheet(
+      "ИНФО", 
+      "Уже есть в базе (" + alreadyExistIsins.length + " шт.): " + alreadyExistIsins.join(", "), 
+      alreadyExistIsins.length
+    );
+  }
+  
+  // ============================================================
+  // 4. ПАКЕТНАЯ ДОЗАПИСЬ НОВЫХ БУМАГ
+  // ============================================================
+  
+  if (newBondsData.length > 0) {
+    var startRow = bondSheet.getLastRow() + 1;
+    bondSheet.getRange(startRow, 1, newBondsData.length, 20).setValues(newBondsData);
+    
+    writeToLogSheet("УСПЕХ", "Добавлено новых бумаг в базу: " + newBondsData.length, newBondsData.length);
+    
+    // Принудительно запускаем перерасчет YTM для добавленных позиций
+    updateAllBondValuesFromCache();
+  } else {
+    var totalChecked = calIsins.length;
+    var skipped = invalidIsins.length + notFoundIsins.length + alreadyExistIsins.length;
+    writeToLogSheet("ИНФО", "Новых бумаг не найдено. Проверено " + totalChecked + ", пропущено " + skipped, 0);
+  }
+}
+
+// ============================================================================
+// ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ: ПРОВЕРКА ФОРМАТА ISIN
+// ============================================================================
+
+/**
+ * Проверяет, соответствует ли строка формату ISIN
+ * ISIN = 2 буквы + 9 букв/цифр + 1 контрольная цифра
+ * @param {string} isin - Строка для проверки
+ * @return {boolean} true - если формат правильный
+ */
+function isValidIsinFormat(isin) {
+  if (!isin || typeof isin !== 'string') return false;
+  
+  var cleanIsin = isin.trim().toUpperCase();
+  
+  // ISIN должен быть длиной 12 символов
+  if (cleanIsin.length !== 12) return false;
+  
+  // Первые 2 символа должны быть буквами (RU, SU, US, XS и т.д.)
+  var firstTwo = cleanIsin.substring(0, 2);
+  if (!firstTwo.match(/^[A-Z]{2}$/)) return false;
+  
+  // Остальные 10 символов должны быть буквами или цифрами
+  var rest = cleanIsin.substring(2);
+  if (!rest.match(/^[A-Z0-9]{10}$/)) return false;
+  
+  return true;
+}
+
+// ============================================================================
+// ДОПОЛНИТЕЛЬНАЯ ФУНКЦИЯ: РУЧНАЯ ПРОВЕРКА ISIN (ДЛЯ ДИАГНОСТИКИ)
+// ============================================================================
+
+function checkIsinList() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var calSheet = ss.getSheetByName("КалендарьИнвестора");
+  
+  if (!calSheet || calSheet.getLastRow() < 2) {
+    SpreadsheetApp.getUi().alert("❌ Лист 'КалендарьИнвестора' пуст или не найден.");
+    return;
+  }
+  
+  // Читаем ISIN из календаря
+  var calLastRow = calSheet.getLastRow();
+  var calIsins = calSheet.getRange("B2:B" + calLastRow).getValues();
+  var calNames = calSheet.getRange("A2:A" + calLastRow).getValues();
+  
+  var validIsins = [];
+  var invalidIsins = [];
+  var notFoundIsins = [];
+  var foundIsins = [];
+  var totalChecked = 0;
+  
+  // Получаем кэш MOEX
+  writeToLogSheet("ИНФО", "Запуск ручной проверки ISIN...", 0);
+  var moexCache = fetchAllMoexDataBatch();
+  
+  for (var i = 0; i < calIsins.length; i++) {
+    var isin = String(calIsins[i][0]).trim().toUpperCase();
+    var name = String(calNames[i][0]).trim();
+    
+    if (!isin || isin === "" || isin === "ИТОГ_МЕСЯЦ" || isin.indexOf("ИТОГ") !== -1) {
+      continue;
+    }
+    
+    totalChecked++;
+    
+    // Проверяем формат
+    if (!isValidIsinFormat(isin)) {
+      invalidIsins.push(isin + " (" + name + ")");
+      continue;
+    }
+    
+    validIsins.push(isin);
+    
+    // Проверяем наличие на MOEX
+    if (moexCache[isin]) {
+      foundIsins.push(isin + " (цена: " + moexCache[isin].price + ", НКД: " + moexCache[isin].nkd + ")");
+    } else {
+      notFoundIsins.push(isin + " (" + name + ")");
+    }
+  }
+  
+  // ============================================================
+  // ФОРМИРУЕМ ОТЧЕТ
+  // ============================================================
+  
+  var message = "📊 **РЕЗУЛЬТАТ ПРОВЕРКИ ISIN**\n";
+  message += "═══════════════════════════════════\n\n";
+  message += "📝 Проверено ISIN: " + totalChecked + "\n";
+  message += "✅ Валидных форматов: " + validIsins.length + "\n";
+  message += "❌ Невалидных форматов: " + invalidIsins.length + "\n";
+  message += "✅ Найдено на MOEX: " + foundIsins.length + "\n";
+  message += "❌ Не найдено на MOEX: " + notFoundIsins.length + "\n\n";
+  
+  if (invalidIsins.length > 0) {
+    message += "⚠️ **НЕВАЛИДНЫЙ ФОРМАТ ISIN:**\n";
+    message += invalidIsins.join("\n") + "\n\n";
+  }
+  
+  if (notFoundIsins.length > 0) {
+    message += "⚠️ **НЕ НАЙДЕНЫ НА MOEX:**\n";
+    message += notFoundIsins.join("\n") + "\n\n";
+  }
+  
+  if (foundIsins.length > 0) {
+    message += "✅ **НАЙДЕНЫ НА MOEX:**\n";
+    message += foundIsins.join("\n");
+  }
+  
+  // Показываем результат
+  var ui = SpreadsheetApp.getUi();
+  ui.alert(message);
+  
+  // Записываем в логи
+  writeToLogSheet(
+    "ИНФО", 
+    "Ручная проверка: валидных " + validIsins.length + ", найдено " + foundIsins.length + ", ошибок " + invalidIsins.length, 
+    foundIsins.length
+  );
+}
+
+
+// ============================================================================
+// БЛОК 10. КРОСС-ПЛАТФОРМЕННЫЙ ПАРСЕР ДАТ С ЗАЩИТОЙ ВРЕМЕННЫХ ЗОН
+// ============================================================================
+
+/**
+ * Безопасно преобразует любые текстовые форматы дат в объект Date без смещения таймзон
+ * @param {string|Date} dateVal Входное значение (строка типа "25.12.2026", "2026-12-25" или объект Date)
+ * @return {Date|null} Корректный объект Date с обнуленным временем или null при ошибке
+ */
+function parseDateLocal(dateVal) {
+  if (!dateVal) return null;
+  
+  // Если на вход уже пришел готовый объект Date, просто обнуляем время
+  if (dateVal instanceof Date) {
+    var cleanDate = new Date(dateVal.getTime());
+    cleanDate.setHours(0, 0, 0, 0);
+    return cleanDate;
+  }
+  
+  var dateStr = String(dateVal).trim();
+  if (dateStr === "" || dateStr.indexOf("NaN") !== -1) return null;
+  
+  var day, month, year;
+  
+  // Вариант 1: Формат ДД.ММ.ГГГГ или ДД/ММ/ГГГГ (стандарт БКС и ручного ввода)
+  if (dateStr.indexOf('.') !== -1 || dateStr.indexOf('/') !== -1) {
+    var separator = dateStr.indexOf('.') !== -1 ? '.' : '/';
+    var parts = dateStr.split(separator);
+    if (parts.length === 3) {
+      day = parseInt(parts[0], 10);
+      month = parseInt(parts[1], 10) - 1; // В JS месяцы идут от 0 до 11
+      year = parseInt(parts[2], 10);
+    }
+  } 
+  // Вариант 2: Формат ГГГГ-ММ-ДД (стандарт ответов MOEX ISS)
+  else if (dateStr.indexOf('-') !== -1) {
+    var isoParts = dateStr.split('-');
+    if (isoParts.length === 3) {
+      year = parseInt(isoParts[0], 10);
+      month = parseInt(isoParts[1], 10) - 1;
+      day = parseInt(isoParts[2], 10);
+    }
+  }
+  
+  // Если ни один формат не подошел, пробуем стандартный конструктор
+  if (isNaN(day) || isNaN(month) || isNaN(year)) {
+    var fallbackDate = new Date(dateStr);
+    if (!isNaN(fallbackDate.getTime())) {
+      fallbackDate.setHours(0, 0, 0, 0);
+      return fallbackDate;
+    }
+    return null;
+  }
+  
+  // Создаем локальную дату без влияния часового пояса сервера Google
+  var finalResultDate = new Date(year, month, day, 0, 0, 0, 0);
+  return isNaN(finalResultDate.getTime()) ? null : finalResultDate;
+}
+
+// ============================================================================
+// БЛОК 11. СИСТЕМА АВТОНОМНОГО ЛОГИРОВАНИЯ И ОТЛАДКИ ОШИБОК ПОРТФЕЛЯ
+// ============================================================================
+
+function writeToLogSheet(status, message, count) {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var logSheet = ss.getSheetByName("Логи");
+    
+    // Если листа нет — создаем с нуля
+    if (!logSheet) {
+      logSheet = ss.insertSheet("Логи");
+      // Сразу создаем шапку
+      logSheet.getRange("A1:D1").setValues([["Время (МСК)", "Статус", "Сообщение / Ошибка", "Обновлено бумаг"]])
+               .setFontWeight("bold")
+               .setBackground("#f3f3f3")
+               .setHorizontalAlignment("center");
+      logSheet.setFrozenRows(1);
+      
+      // Устанавливаем ширину колонок
+      logSheet.setColumnWidth(1, 160); // Время
+      logSheet.setColumnWidth(2, 100); // Статус
+      logSheet.setColumnWidth(3, 500); // Сообщение
+      logSheet.setColumnWidth(4, 120); // Кол-во
+    }
+    
+    // Формируем строку лога
+    var timestamp = Utilities.formatDate(new Date(), "GMT+3", "dd.MM.yyyy HH:mm:ss");
+    var newRow = [timestamp, status, message, count || 0];
+    
+    // Вставляем новую запись ВСЕГДА НА ВТОРУЮ СТРОКУ (свежие логи сверху)
+    logSheet.insertRowBefore(2);
+    logSheet.getRange(2, 1, 1, 4).setValues([newRow]);
+    
+    // Применяем горизонтальное выравнивание для новой строки
+    logSheet.getRange(2, 1, 1, 4).setHorizontalAlignment("center");
+    
+    // Цветовая индикация критичности логов
+    var statusCell = logSheet.getRange(2, 2);
+    if (status === "УСПЕХ") {
+      statusCell.setBackground("#d4edda").setFontColor("#155724");
+    } else if (status === "ОШИБКА") {
+      statusCell.setBackground("#f8d7da").setFontColor("#721c24");
+      // Для ошибок делаем жирным шрифт
+      statusCell.setFontWeight("bold");
+    } else if (status === "ПРЕДУПРЕЖДЕНИЕ") {
+      statusCell.setBackground("#fff3cd").setFontColor("#856404");
+    } else if (status === "ИНФО") {
+      statusCell.setBackground("#cce5ff").setFontColor("#004085");
+    }
+    
+    // Автоматическая очистка старых логов (оставляем только 100 последних записей)
+    var maxRows = 100;
+    var totalRows = logSheet.getLastRow();
+    if (totalRows > maxRows) {
+      // Удаляем строки начиная с 101-й (первая - шапка)
+      logSheet.deleteRows(maxRows + 1, totalRows - maxRows);
+    }
+    
+    // Авто-подгонка ширины колонок (только если есть данные)
+    if (logSheet.getLastRow() > 0) {
+      logSheet.autoResizeColumns(1, 4);
+    }
+    
+    SpreadsheetApp.flush();
+    
+  } catch(e) {
+    // Если логирование сломалось, пишем в системный лог Google Apps Script
+    Logger.log("КРИТИЧЕСКАЯ ОШИБКА ЛОГГЕРА: " + e.message);
+  }
+}
+
+// ============================================================================
+// ДОПОЛНИТЕЛЬНАЯ ФУНКЦИЯ: ОЧИСТКА ЛОГОВ (ДЛЯ РУЧНОГО ЗАПУСКА)
+// ============================================================================
+
+function clearLogs() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var logSheet = ss.getSheetByName("Логи");
+  if (!logSheet) {
+    SpreadsheetApp.getUi().alert("Лист 'Логи' не найден.");
+    return;
+  }
+  
+  var lastRow = logSheet.getLastRow();
+  if (lastRow > 1) {
+    logSheet.deleteRows(2, lastRow - 1);
+    SpreadsheetApp.getUi().alert("Логи очищены. Шапка таблицы сохранена.");
+  } else {
+    SpreadsheetApp.getUi().alert("Логи уже пусты.");
+  }
+}
+
+// ============================================================================
+// ДОПОЛНИТЕЛЬНАЯ ФУНКЦИЯ: ПРОВЕРКА СТАТУСА ПОРТФЕЛЯ (ДЛЯ БЫСТРОЙ ДИАГНОСТИКИ)
+// ============================================================================
+
+function checkPortfolioHealth() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var logSheet = ss.getSheetByName("Логи");
+  
+  if (!logSheet) {
+    SpreadsheetApp.getUi().alert("❌ Лист 'Логи' отсутствует. Запусти обновление портфеля.");
+    return;
+  }
+  
+  var lastRow = logSheet.getLastRow();
+  if (lastRow < 2) {
+    SpreadsheetApp.getUi().alert("ℹ️ Логов пока нет. Запусти обновление портфеля.");
+    return;
+  }
+  
+  // Читаем последние 5 записей
+  var startRow = Math.max(2, lastRow - 4);
+  var logs = logSheet.getRange(startRow, 2, lastRow - startRow + 1, 3).getValues();
+  
+  var message = "📊 **Последние события портфеля:**\n\n";
+  for (var i = 0; i < logs.length; i++) {
+    var status = logs[i][0];
+    var text = logs[i][1];
+    var count = logs[i][2];
+    
+    var emoji = "●";
+    if (status === "УСПЕХ") emoji = "✅";
+    else if (status === "ОШИБКА") emoji = "❌";
+    else if (status === "ПРЕДУПРЕЖДЕНИЕ") emoji = "⚠️";
+    else if (status === "ИНФО") emoji = "ℹ️";
+    
+    message += emoji + " " + status + ": " + text + (count > 0 ? " (" + count + ")" : "") + "\n";
+  }
+  
+  SpreadsheetApp.getUi().alert(message);
+}
+// ============================================================================
+// БЛОК 12. ДИАГНОСТИЧЕСКИЕ ФУНКЦИИ ДЛЯ ОТЛАДКИ
+// ============================================================================
+
+// ============================================================================
+// ТЕСТ 1: Проверка подключения к MOEX (ИСПРАВЛЕННАЯ)
+// ============================================================================
+
+function testMoexConnection() {
+  try {
+    var testIsin = "RU000A108P46";
+    var url = "https://moex.com/iss/securities/" + testIsin + ".json?iss.meta=off&iss.only=securities,marketdata";
+    
+    var response = UrlFetchApp.fetch(url, {
+      muteHttpExceptions: true,
+      headers: {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    });
+    
+    var status = response.getResponseCode();
+    var message = "📊 **Тест подключения к MOEX**\n\n";
+    message += "ISIN: " + testIsin + "\n";
+    message += "Код ответа: " + status + "\n";
+    
+    if (status === 200) {
+      var json = JSON.parse(response.getContentText());
+      var hasData = json && json.securities && json.securities.data && json.securities.data.length > 0;
+      message += "Данные: " + (hasData ? "✅ ЕСТЬ" : "❌ НЕТ");
+      
+      if (hasData) {
+        var sRow = json.securities.data[0];
+        var sCols = json.securities.columns;
+        var nkdIdx = sCols.indexOf("ACCRUEDINT");
+        var faceIdx = sCols.indexOf("FACEVALUE");
+        var matIdx = sCols.indexOf("MATDATE");
+        var cpnIdx = sCols.indexOf("COUPONVALUE");
+        
+        var nkd = nkdIdx !== -1 ? sRow[nkdIdx] : "не найден";
+        var face = faceIdx !== -1 ? sRow[faceIdx] : "не найден";
+        var maturity = matIdx !== -1 ? sRow[matIdx] : "не найдена";
+        var coupon = cpnIdx !== -1 ? sRow[cpnIdx] : "не найден";
+        
+        var price = "не найдена";
+        if (json.marketdata && json.marketdata.data && json.marketdata.data.length > 0) {
+          var mCols = json.marketdata.columns;
+          var mRow = json.marketdata.data[0];
+          var lastIdx = mCols.indexOf("LAST");
+          if (lastIdx !== -1) {
+            price = mRow[lastIdx];
+          }
+        }
+        
+        message += "\n\n📋 **Данные бумаги:**";
+        message += "\nНКД: " + nkd;
+        message += "\nНоминал: " + face;
+        message += "\nДата погашения: " + maturity;
+        message += "\nКупон: " + coupon;
+        message += "\nЦена (последняя): " + price;
+        
+        writeToLogSheet("ИНФО", "Тест MOEX: " + testIsin + " найден, цена " + price, 0);
+      }
+    } else {
+      message += "\n❌ Ошибка: " + response.getContentText();
+      writeToLogSheet("ОШИБКА", "Тест MOEX: " + testIsin + " → код " + status, 0);
+    }
+    
+    // Показываем результат (с защитой)
+    try {
+      SpreadsheetApp.getUi().alert(message);
+    } catch(e) {
+      writeToLogSheet("ИНФО", "Результат теста записан в логи (UI недоступен)", 0);
+      Logger.log(message);
+    }
+    
+  } catch(e) {
+    var errorMsg = "❌ ОШИБКА: " + e.message + "\n\n";
+    errorMsg += "Проверь:\n";
+    errorMsg += "1. Доступ к интернету\n";
+    errorMsg += "2. Настройки UrlFetchApp\n";
+    errorMsg += "3. Правильность ISIN";
+    
+    try {
+      SpreadsheetApp.getUi().alert(errorMsg);
+    } catch(e2) {
+      Logger.log(errorMsg);
+    }
+    
+    writeToLogSheet("ОШИБКА", "Тест MOEX: " + e.message, 0);
+  }
+}
+
+// ============================================================================
+// ТЕСТ 2: Проверка списка ISIN на MOEX (С УЛУЧШЕННЫМ ПАРСИНГОМ)
+// ============================================================================
+
+function testAllIsinsOnMoex() {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var calSheet = ss.getSheetByName("КалендарьИнвестора");
+    
+    if (!calSheet || calSheet.getLastRow() < 2) {
+      writeToLogSheet("ОШИБКА", "Лист 'КалендарьИнвестора' пуст или не найден", 0);
+      return;
+    }
+    
+    var calLastRow = calSheet.getLastRow();
+    var calIsins = calSheet.getRange("B2:B" + calLastRow).getValues();
+    var calNames = calSheet.getRange("A2:A" + calLastRow).getValues();
+    
+    var results = [];
+    var totalChecked = 0;
+    var found = 0;
+    var notFound = 0;
+    var invalidIsins = [];
+    var foundDetails = [];
+    
+    for (var i = 0; i < calIsins.length; i++) {
+      var isin = String(calIsins[i][0]).trim().toUpperCase();
+      var name = String(calNames[i][0]).trim();
+      
+      if (!isin || isin === "" || isin === "ИТОГ_МЕСЯЦ" || isin.indexOf("ИТОГ") !== -1) {
+        continue;
+      }
+      
+      totalChecked++;
+      
+      if (!isValidIsinFormat(isin)) {
+        invalidIsins.push(isin + " (" + name + ")");
+        results.push("⚠️ " + isin + " (" + name + ") - НЕВАЛИДНЫЙ ФОРМАТ");
+        notFound++;
+        continue;
+      }
+      
+      var url = "https://moex.com/iss/securities.json?q=" + isin + "&iss.meta=off&iss.only=securities,marketdata";
+      
+      try {
+        Utilities.sleep(200);
+        
+        var response = UrlFetchApp.fetch(url, {
+          muteHttpExceptions: true,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json'
+          }
+        });
+        
+        if (response.getResponseCode() === 200) {
+          var json = JSON.parse(response.getContentText());
+          
+          var hasData = false;
+          var price = "не найдена";
+          var nkd = "не найден";
+          var maturity = "не найдена";
+          var coupon = "не найден";
+          var faceValue = "не найден";
+          
+          // ============================================================
+          // ПАРСИМ securities
+          // ============================================================
+          if (json && json.securities && json.securities.data && json.securities.data.length > 0) {
+            hasData = true;
+            
+            var sCols = json.securities.columns;
+            var sRow = json.securities.data[0];
+            
+            // Ищем индексы с запасными вариантами
+            var nkdIdx = sCols.indexOf("ACCRUEDINT");
+            if (nkdIdx === -1) nkdIdx = sCols.indexOf("ACCRUEDINT_VALUE");
+            
+            var matIdx = sCols.indexOf("MATDATE");
+            if (matIdx === -1) matIdx = sCols.indexOf("MATURITYDATE");
+            
+            var faceIdx = sCols.indexOf("FACEVALUE");
+            if (faceIdx === -1) faceIdx = sCols.indexOf("FACEVALUE_START");
+            
+            var cpnIdx = sCols.indexOf("COUPONVALUE");
+            if (cpnIdx === -1) cpnIdx = sCols.indexOf("COUPONPERCENT");
+            
+            // Извлекаем значения
+            nkd = nkdIdx !== -1 ? sRow[nkdIdx] : "не найден";
+            maturity = matIdx !== -1 ? sRow[matIdx] : "не найдена";
+            faceValue = faceIdx !== -1 ? sRow[faceIdx] : "не найден";
+            coupon = cpnIdx !== -1 ? sRow[cpnIdx] : "не найден";
+          }
+          
+          // ============================================================
+          // ПАРСИМ marketdata (цены)
+          // ============================================================
+          if (json && json.marketdata && json.marketdata.data && json.marketdata.data.length > 0) {
+            var mCols = json.marketdata.columns;
+            var mRow = json.marketdata.data[0];
+            
+            // Ищем цену с запасными вариантами
+            var priceIdx = mCols.indexOf("LAST");
+            if (priceIdx === -1) priceIdx = mCols.indexOf("LCURRENTPRICE");
+            if (priceIdx === -1) priceIdx = mCols.indexOf("MARKETPRICE");
+            if (priceIdx === -1) priceIdx = mCols.indexOf("PREVPRICE");
+            
+            if (priceIdx !== -1 && mRow[priceIdx]) {
+              price = mRow[priceIdx];
+            }
+            
+            // Если цена не найдена, пробуем найти через BID/OFFER
+            if (price === "не найдена" || price === "0") {
+              var bidIdx = mCols.indexOf("BID");
+              var offerIdx = mCols.indexOf("OFFER");
+              var avgPrice = 0;
+              
+              if (bidIdx !== -1 && offerIdx !== -1) {
+                var bid = parseFloat(mRow[bidIdx]) || 0;
+                var offer = parseFloat(mRow[offerIdx]) || 0;
+                if (bid > 0 && offer > 0) {
+                  avgPrice = (bid + offer) / 2;
+                  price = avgPrice.toString();
+                }
+              }
+            }
+          }
+          
+          // Если данные есть, добавляем в результат
+          if (hasData) {
+            var detail = isin + " → цена: " + price + ", НКД: " + nkd + ", купон: " + coupon;
+            foundDetails.push(detail);
+            results.push("✅ " + isin + " (" + name + ") - НАЙДЕН (цена: " + price + ")");
+            found++;
+          } else {
+            results.push("❌ " + isin + " (" + name + ") - НЕТ ДАННЫХ");
+            notFound++;
+          }
+        } else {
+          results.push("❌ " + isin + " (" + name + ") - КОД " + response.getResponseCode());
+          notFound++;
+        }
+      } catch(e) {
+        results.push("❌ " + isin + " (" + name + ") - ОШИБКА: " + e.message);
+        notFound++;
+        writeToLogSheet("ОШИБКА", isin + ": " + e.message, 0);
+      }
+    }
+    
+    // ============================================================
+    // ФОРМИРУЕМ ОТЧЕТ
+    // ============================================================
+    
+    var report = "📊 **РЕЗУЛЬТАТ ПРОВЕРКИ ISIN НА MOEX**\n\n";
+    report += "📝 Проверено: " + totalChecked + "\n";
+    report += "✅ Найдено: " + found + "\n";
+    report += "❌ Не найдено: " + notFound + "\n";
+    
+    if (invalidIsins.length > 0) {
+      report += "⚠️ Невалидный формат: " + invalidIsins.length + "\n";
+    }
+    
+    if (foundDetails.length > 0) {
+      report += "\n📋 **Найденные бумаги (с данными):**\n";
+      // Показываем только уникальные записи
+      var uniqueDetails = foundDetails.filter(function(item, index) {
+        return foundDetails.indexOf(item) === index;
+      });
+      report += uniqueDetails.slice(0, 10).join("\n");
+      if (uniqueDetails.length > 10) {
+        report += "\n... и еще " + (uniqueDetails.length - 10) + " записей";
+      }
+    }
+    
+    report += "\n\n═══════════════════════════════\n";
+    var displayResults = results.slice(0, 30);
+    if (results.length > 30) {
+      displayResults.push("... и еще " + (results.length - 30) + " записей");
+    }
+    report += displayResults.join("\n");
+    
+    writeToLogSheet("ИНФО", "Тест всех ISIN: найдено " + found + " из " + totalChecked, found);
+    
+    try {
+      var ui = SpreadsheetApp.getUi();
+      if (report.length > 50000) {
+        report = report.substring(0, 49000) + "\n\n... (обрезано)";
+      }
+      ui.alert(report);
+    } catch(e) {
+      writeToLogSheet("ИНФО", "Отчет сгенерирован (UI недоступен)", 0);
+      Logger.log(report);
+    }
+    
+  } catch(e) {
+    writeToLogSheet("ОШИБКА", "testAllIsinsOnMoex: " + e.message, 0);
+    Logger.log("Ошибка: " + e.message);
+  }
+}
+
+/**
+ * ТЕСТ 3: Проверка альтернативного URL MOEX (ISS)
+ * Запусти эту функцию, если основной URL не работает
+ */
+function testAlternativeMoexUrl() {
+  var testIsin = "RU000A108P46";
+  
+  // Варианты URL для тестирования
+  var urls = [
+    "https://moex.com/iss/securities/" + testIsin + ".json?iss.meta=off",
+    "https://iss.moex.com/iss/securities/" + testIsin + ".json?iss.meta=off",
+    "https://moex.com/iss/securities.json?q=" + testIsin
+  ];
+  
+  var message = "🔍 **Тестирование альтернативных URL MOEX**\n\n";
+  message += "ISIN: " + testIsin + "\n\n";
+  
+  for (var i = 0; i < urls.length; i++) {
+    var url = urls[i];
+    try {
+      var response = UrlFetchApp.fetch(url, {
+        muteHttpExceptions: true,
+        headers: {'User-Agent': 'Mozilla/5.0'}
+      });
+      
+      var status = response.getResponseCode();
+      var result = status === 200 ? "✅ РАБОТАЕТ" : "❌ ОШИБКА " + status;
+      message += (i+1) + ". " + url + "\n   → " + result + "\n\n";
+      
+    } catch(e) {
+      message += (i+1) + ". " + url + "\n   → ❌ " + e.message + "\n\n";
+    }
+  }
+  
+  SpreadsheetApp.getUi().alert(message);
+}
+
+
+// ============================================================================
+// ДИАГНОСТИКА: ПРОВЕРКА РЕАЛЬНОЙ СТРУКТУРЫ ОТВЕТА MOEX (ИСПРАВЛЕННАЯ)
+// ============================================================================
+
+function diagnoseMoexResponse() {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var testIsin = "RU000A10DSG1";
+    
+    // ПРАВИЛЬНЫЙ URL: используем поиск с расширенными параметрами
+    var url = "https://moex.com/iss/securities.json?q=" + testIsin + 
+              "&iss.meta=off&iss.only=securities,marketdata";
+    
+    var response = UrlFetchApp.fetch(url, {
+      muteHttpExceptions: true,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      }
+    });
+    
+    if (response.getResponseCode() === 200) {
+      var json = JSON.parse(response.getContentText());
+      
+      var message = "📊 **ДИАГНОСТИКА MOEX**\n\n";
+      message += "ISIN: " + testIsin + "\n\n";
+      
+      // ============================================================
+      // 1. ПОКАЗЫВАЕМ ВСЕ КОЛОНКИ ИЗ securities
+      // ============================================================
+      if (json.securities && json.securities.columns) {
+        message += "📋 **Колонки securities:**\n";
+        message += json.securities.columns.join(", ") + "\n\n";
+        
+        if (json.securities.data && json.securities.data.length > 0) {
+          message += "📋 **Данные securities (первая строка):**\n";
+          var sRow = json.securities.data[0];
+          for (var i = 0; i < json.securities.columns.length; i++) {
+            var colName = json.securities.columns[i];
+            var value = sRow[i] !== undefined ? sRow[i] : "null";
+            message += colName + " = " + value + "\n";
+          }
+        }
+      }
+      
+      // ============================================================
+      // 2. ПОКАЗЫВАЕМ ВСЕ КОЛОНКИ ИЗ marketdata (здесь должны быть цены и НКД)
+      // ============================================================
+      if (json.marketdata && json.marketdata.columns) {
+        message += "\n📋 **Колонки marketdata:**\n";
+        message += json.marketdata.columns.join(", ") + "\n\n";
+        
+        if (json.marketdata.data && json.marketdata.data.length > 0) {
+          message += "📋 **Данные marketdata (первая строка):**\n";
+          var mRow = json.marketdata.data[0];
+          for (var j = 0; j < json.marketdata.columns.length; j++) {
+            var colName = json.marketdata.columns[j];
+            var value = mRow[j] !== undefined ? mRow[j] : "null";
+            message += colName + " = " + value + "\n";
+          }
+        }
+      }
+      
+      // Записываем в логи
+      writeToLogSheet("ИНФО", "Диагностика MOEX выполнена для " + testIsin, 0);
+      
+      // ============================================================
+      // ПОКАЗЫВАЕМ РЕЗУЛЬТАТ (с защитой от ошибки UI)
+      // ============================================================
+      try {
+        var ui = SpreadsheetApp.getUi();
+        if (message.length > 50000) {
+          message = message.substring(0, 49000) + "\n\n... (обрезано)";
+        }
+        ui.alert(message);
+      } catch(e) {
+        // Если UI недоступен, пишем в логи
+        Logger.log(message);
+        // И создаем временный лист с результатом
+        try {
+          var reportSheet = ss.getSheetByName("Диагностика_MOEX");
+          if (!reportSheet) {
+            reportSheet = ss.insertSheet("Диагностика_MOEX");
+          } else {
+            reportSheet.clear();
+          }
+          reportSheet.getRange("A1").setValue(message);
+          reportSheet.getRange("A1").setWrap(true);
+          reportSheet.setColumnWidth(1, 800);
+          SpreadsheetApp.getUi().alert("Результат диагностики записан на лист 'Диагностика_MOEX'");
+        } catch(e2) {
+          Logger.log("Не удалось создать лист: " + e2.message);
+        }
+      }
+      
+    } else {
+      var errorMsg = "Ошибка: код " + response.getResponseCode();
+      try {
+        SpreadsheetApp.getUi().alert(errorMsg);
+      } catch(e) {
+        Logger.log(errorMsg);
+      }
+    }
+    
+  } catch(e) {
+    var errorMsg = "Ошибка: " + e.message;
+    try {
+      SpreadsheetApp.getUi().alert(errorMsg);
+    } catch(e2) {
+      Logger.log(errorMsg);
+    }
+    writeToLogSheet("ОШИБКА", "diagnoseMoexResponse: " + e.message, 0);
+  }
+}
